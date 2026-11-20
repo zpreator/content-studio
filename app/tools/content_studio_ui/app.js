@@ -236,26 +236,34 @@ async function viewTopic(topicId, nodeId, query) {
   topicIns.value = cfg.instructions.topics?.[topic.id] || "";
   const saveIns = () => guarded(async () => { cfg.instructions.topics[topic.id] = topicIns.value; await api("PUT", "/api/config", { instructions: cfg.instructions }); toast("Topic instructions saved"); });
 
-  const t0 = topicOf(topic.id), ck0 = t0.check;
-  const approveBtn = t0.approved
-    ? h("button", { class: "ghost", title: "This topic's approved cards can be exported to the game. Click to take it out.", onclick: () => setApproved(topic, false) }, "\u2713 Approved for the game (click to undo)")
-    : h("button", { class: "good", disabled: !t0.can_approve, title: t0.can_approve ? "" : "Approve at least one question first", onclick: () => setApproved(topic, true) }, "Approve topic for the game");
-  const topicBar = h("div", { class: "row", style: "margin-top:12px" }, approveBtn,
-    aiBar(topic, null, { pendingCheck: ck0.unchecked + ck0.stale, canCheck: ck0.unchecked + ck0.stale + ck0.ok + ck0.issues > 0, canFill: true,
-      hint: [ck0.issues ? `${ck0.issues} with issues` : "", ck0.stale ? `${ck0.stale} changed since checked` : "", ck0.unchecked ? `${ck0.unchecked} unchecked` : ""].filter(Boolean).join(" - ") }),
-    h("button", { class: "ghost", onclick: () => createNode(topic, "source", [], BLANK_SOURCE) }, "+ Add a source by hand"));
-  const seedN = h("input", { type: "number", value: 10, min: 1, max: 40, style: "width:64px" });
-  const emptyPanel = totalNodes(t0) === 0 ? h("div", { class: "panel emptypanel", style: "margin-bottom:14px" },
-    h("h2", {}, "This topic is empty"),
-    h("p", { class: "muted" }, "Let the AI find one source and pull facts out of it, or build everything by hand."),
-    h("div", { class: "row" }, "Facts to pull", seedN,
-      h("button", { class: "primary", onclick: () => runDispatch("fill", topic, null, { count: Math.max(1, +seedN.value || 10) }) }, "Find a source and facts"),
-      h("button", { onclick: () => createNode(topic, "source", [], BLANK_SOURCE) }, "+ Add a source by hand")),
-    h("div", { class: "muted small", style: "margin-top:8px" }, "You will see the exact prompt first and can edit it, e.g. 'only well-known world capitals' or 'keep facts to events after 2000'.")) : null;
+  // The top bar (approve / check / fill) and the empty-topic panel are rebuilt from fresh state after every run or edit.
+  const topBarBox = h("div", {}), emptyBox = h("div", {});
+  function renderTop() {
+    const t0 = topicOf(topic.id), ck0 = t0.check;
+    const approveBtn = t0.approved
+      ? h("button", { class: "ghost", title: "This topic's approved cards can be exported to the game. Click to take it out.", onclick: () => setApproved(topic, false) }, "\u2713 Approved for the game (click to undo)")
+      : h("button", { class: "good", disabled: !t0.can_approve, title: t0.can_approve ? "" : "Approve at least one question first", onclick: () => setApproved(topic, true) }, "Approve topic for the game");
+    const topicBar = h("div", { class: "row", style: "margin-top:12px" }, approveBtn,
+      aiBar(topic, null, { pendingCheck: ck0.unchecked + ck0.stale, canCheck: ck0.unchecked + ck0.stale + ck0.ok + ck0.issues > 0, canFill: true,
+        extra: [writeAllBtn(topic, null, t0.pending.draft_questions)].filter(Boolean),
+        hint: [ck0.issues ? `${ck0.issues} with issues` : "", ck0.stale ? `${ck0.stale} changed since checked` : "", ck0.unchecked ? `${ck0.unchecked} unchecked` : ""].filter(Boolean).join(" - ") }),
+      h("button", { class: "ghost", onclick: () => createNode(topic, "source", [], BLANK_SOURCE) }, "+ Add a source by hand"));
+    const seedN = h("input", { type: "number", value: 10, min: 1, max: 40, style: "width:64px" });
+    const emptyPanel = totalNodes(t0) === 0 ? h("div", { class: "panel emptypanel", style: "margin-bottom:14px" },
+      h("h2", {}, "This topic is empty"),
+      h("p", { class: "muted" }, "Let the AI find one source and pull facts out of it, or build everything by hand."),
+      h("div", { class: "row" }, "Facts to pull", seedN,
+        h("button", { class: "primary", onclick: () => runDispatch("fill", topic, null, { count: Math.max(1, +seedN.value || 10) }) }, "Find a source and facts"),
+        h("button", { onclick: () => createNode(topic, "source", [], BLANK_SOURCE) }, "+ Add a source by hand")),
+      h("div", { class: "muted small", style: "margin-top:8px" }, "You will see the exact prompt first and can edit it, e.g. 'only well-known world capitals' or 'keep facts to events after 2000'.")) : null;
+    topBarBox.replaceChildren(topicBar);
+    emptyBox.replaceChildren(...(emptyPanel ? [emptyPanel] : []));
+  }
+  renderTop();
   const pipeline = h("div", { class: "panel", style: "margin-bottom:14px" },
     h("div", { class: "row", style: "justify-content:space-between" }, h("div", {}, h("h1", { style: "display:inline" }, h("span", { class: "dot", style: `background:${deptColor(topic.department)}` }), topic.name), h("span", { class: "muted", style: "margin-left:10px" }, `${topic.department} - ${topic.exportable}/${topic.target} export-ready`), topic.stage !== "active" ? h("span", { class: "chip", style: "margin-left:10px" }, topic.stage) : null),
       h("a", { onclick: () => go(topic.stage === "active" ? "#/board" : "#/ideas") }, topic.stage === "active" ? "back to board" : "back to ideas")),
-    topicBar,
+    topBarBox,
     h("details", { class: "pipe-details", open: false, style: "margin-top:10px" },
     h("summary", { class: "muted" }, "Batch AI steps and difficulty spread"),
     h("div", { class: "actions", style: "margin-top:12px" },
@@ -284,7 +292,7 @@ async function viewTopic(topicId, nodeId, query) {
   statusSel.value = ui.filters.status;
   const search = h("input", { type: "text", placeholder: "search", value: ui.filters.q, style: "flex:1", oninput: () => { ui.filters.q = search.value; renderList(); } });
 
-  $view.replaceChildren(pipeline, ...(emptyPanel ? [emptyPanel] : []), h("div", { class: "topic-layout" + (nodeId ? " has-sel" : "") },
+  $view.replaceChildren(pipeline, emptyBox, h("div", { class: "topic-layout" + (nodeId ? " has-sel" : "") },
     h("div", { class: "panel tree-panel" }, h("div", { class: "row", style: "margin-bottom:8px" }, kindSel, statusSel, search),
       h("div", { class: "row", style: "margin-bottom:6px" }, h("button", { class: "good", onclick: () => bulkApprove(topic, null, () => reloadAll()) }, "Approve all drafts in topic")), listBox), detailBox));
 
@@ -314,7 +322,7 @@ async function viewTopic(topicId, nodeId, query) {
     }
     listBox.replaceChildren(...(out.length ? out : [h("div", { class: "muted", style: "padding:12px" }, nodes.length ? "Nothing matches the filters." : "No nodes yet. Use \"Find a source and facts\" or add a source by hand above.")]));
   }
-  async function loadList() { nodes = (await api("GET", `/api/topics/${topic.id}/nodes`)).nodes; renderList(); spreadBox.replaceChildren(spreadPanel(topicOf(topic.id))); renderFacets(); }
+  async function loadList() { nodes = (await api("GET", `/api/topics/${topic.id}/nodes`)).nodes; renderTop(); renderList(); spreadBox.replaceChildren(spreadPanel(topicOf(topic.id))); renderFacets(); }
   function explanationsRow(t) {
     const ex = t.explanations || { written: 0, verified: 0, missing: 0 };
     return h("div", { style: "margin-top:12px" }, h("h3", {}, "Explanations (the 'did you know' line)"),
@@ -401,8 +409,13 @@ function aiBar(topic, node, o) {
     h("button", { disabled: !o.canCheck, title: o.checkHint || "Check the cards here against their facts (only what is new or changed since the last check)", onclick: () => runDispatch("check", topic, node?.id) },
       "Check for accuracy" + (o.pendingCheck ? ` (${o.pendingCheck})` : "")),
     h("button", { disabled: !o.canFill, title: o.fillHint || "Fill in whatever is blank here. Never overwrites anything you have written.", onclick: () => runDispatch("fill", topic, node?.id) }, "Fill in automatically"),
+    ...(o.extra || []),
     o.hint ? h("span", { class: "muted small" }, o.hint) : null);
 }
+
+// "Write questions for every fact" beneath a source or topic (30 per run; the preview says how many are left).
+const writeAllBtn = (topic, nodeId, n) => n > 0 ? h("button", { class: "primary", title: n > 30 ? `${n} facts have no question yet - this does 30 at a time` : "Draft a question for every fact here that has none",
+  onclick: () => runDispatch("fill", topic, nodeId, { what: "questions" }) }, `Write questions for ${n === 1 ? "the fact" : `all ${n} facts`}${n > 30 ? " (30 at a time)" : ""}`) : null;
 
 function confirmModal(title, text, yesLabel, yesClass, onYes) {
   modal(title, h("div", {}, h("p", {}, text)), [{ label: "Cancel" }, { label: yesLabel, cls: yesClass, fn: () => guarded(onYes) }]);
@@ -665,7 +678,7 @@ function nodeDetail(d, topic, reload) {
       ? { pendingCheck, canCheck: !!ck.has_fact, checkHint: ck.has_fact ? "" : "No fact to check against - this card has no parent fact", canFill: (ck.missing || []).length > 0,
           fillHint: (ck.missing || []).length ? "" : "Nothing is blank on this card", hint: (ck.missing || []).length ? `Blank: ${ck.missing.join(", ")}` : "" }
       : { pendingCheck, canCheck: !!roll && roll.unchecked + roll.stale + roll.ok + roll.issues > 0, checkHint: "No cards beneath this to check yet",
-          canFill: true, hint: roll ? [roll.issues ? `${roll.issues} with issues` : "", roll.stale ? `${roll.stale} changed since checked` : "", roll.unchecked ? `${roll.unchecked} unchecked` : ""].filter(Boolean).join(" - ") : "" }));
+          canFill: true, fillHint: node.kind === "source" ? "Read this source and add new facts from it" : "", extra: [writeAllBtn(topic, node.id, d.facts_waiting)].filter(Boolean), hint: roll ? [roll.issues ? `${roll.issues} with issues` : "", roll.stale ? `${roll.stale} changed since checked` : "", roll.unchecked ? `${roll.unchecked} unchecked` : ""].filter(Boolean).join(" - ") : "" }));
   const act = (action) => guarded(async () => { await api("POST", `/api/nodes/${node.id}/suggestion`, { action }); await reload(); });
   const lastHist = node.history[node.history.length - 1];
   const view = (v) => Array.isArray(v) ? v.join("  |  ") : String(v ?? "");
