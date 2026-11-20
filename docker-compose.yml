@@ -1,0 +1,12 @@
+services:
+  content-studio:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3004:3000"
+    mem_limit: 768m
+    volumes:
+      - ./content:/app/content        # the studio's source of truth: config, topics, runs
+      - ./data:/app/data              # exported game files (data/<topic>/curriculum.json)
+      - ./secrets:/secrets            # access token (never leaves the server)
+      - ./claude-config:/config       # Claude Code login, so AI runs survive rebuilds

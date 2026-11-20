@@ -1,0 +1,9 @@
+# Runtime volumes / local state — never commit (credentials, Claude login, user data)
+secrets/
+claude-config/
+data/
+content/
+.env
+__pycache__/
+*.pyc
+.DS_Store
