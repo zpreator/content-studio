@@ -30,7 +30,6 @@ function h(tag, props, ...kids) {
 async function api(method, path, body) {
   const res = await fetch(path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) { location.href = "/login"; }
   if (!res.ok) { const e = new Error(data.error || res.statusText); e.data = data; throw e; }
   return data;
 }
@@ -639,8 +638,7 @@ async function viewSettings() {
     h("div", { class: "panel", style: "margin-top:12px" }, h("h2", {}, "Topics: targets and OpenTDB import hints"),
       h("table", { class: "board" }, h("thead", {}, h("tr", {}, ["Topic", "Target cards", "OpenTDB category ids", "Keyword filter"].map(x => h("th", {}, x)))),
         h("tbody", {}, topicRows.map(r => h("tr", {}, h("td", {}, r.t.name), h("td", {}, r.target), h("td", {}, r.cats), h("td", {}, r.words)))))),
-    h("div", { class: "row", style: "margin-top:12px" }, h("button", { class: "primary", onclick: save }, "Save settings"),
-      h("form", { method: "post", action: "/logout", style: "margin-left:auto" }, h("button", { type: "submit" }, "Sign out of this device"))));
+    h("div", { class: "row", style: "margin-top:12px" }, h("button", { class: "primary", onclick: save }, "Save settings")));
 }
 
 // ---------------------------------------------------------------- export

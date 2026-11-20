@@ -8,5 +8,4 @@ services:
     volumes:
       - ./content:/app/content        # the studio's source of truth: config, topics, runs
       - ./data:/app/data              # exported game files (data/<topic>/curriculum.json)
-      - ./secrets:/secrets            # access token (never leaves the server)
       - ./claude-config:/config       # Claude Code login, so AI runs survive rebuilds

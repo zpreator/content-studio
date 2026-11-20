@@ -1,4 +1,5 @@
 # Runtime volumes / local state — never commit (credentials, Claude login, user data)
+# legacy token/password files from before login removal
 secrets/
 claude-config/
 data/
