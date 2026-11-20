@@ -515,6 +515,7 @@ class Store:
             "input_type": node["payload"].get("input_type"), "source_type": node["payload"].get("source_type"),
             "check": check_state(node) if node["kind"] in QUESTION_KINDS else None,
             "has_suggestion": bool(node.get("suggestion")),
+            "has_fact": bool(fact_ancestors(node)) if node["kind"] in QUESTION_KINDS else None,
         }
 
     # -- summaries ---------------------------------------------------------
