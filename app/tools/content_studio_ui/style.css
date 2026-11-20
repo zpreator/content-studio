@@ -128,5 +128,18 @@ table.board td:first-child { white-space: nowrap; }
   .toast { max-width: none; }
 }
 
-.pipe-details > summary { cursor: pointer; padding: 6px 0; }
+.pipe-details > summary { cursor: pointer; padding: 6px 0; list-style: none; }
+.pipe-details > summary::-webkit-details-marker { display: none; }
 .pipe-details > summary::before { content: "\25B8  "; } .pipe-details[open] > summary::before { content: "\25BE  "; }
+
+/* step 2: checks, AI bar, suggestions, search */
+.ck { display: inline-block; width: 16px; height: 16px; line-height: 16px; text-align: center; border-radius: 50%; font-size: 11px; font-weight: 700; margin-right: 6px; flex: none; background: var(--panel2); color: var(--muted); border: 1px solid var(--border); }
+.ck.ok { color: #0e2012; background: var(--green); border-color: var(--green); } .ck.issues { color: #fff; background: var(--red); border-color: var(--red); } .ck.stale { color: #1b1407; background: var(--amber); border-color: var(--amber); }
+.aibar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.chip.ok { border-color: var(--green); color: var(--green); margin-left: 8px; }
+.sug { margin-top: 10px; padding: 10px; border: 1px solid var(--amber); border-radius: 6px; background: #1d1a12; }
+.diff { margin-top: 8px; } .diff .old { white-space: pre-wrap; color: var(--muted); text-decoration: line-through; } .diff .new { white-space: pre-wrap; color: var(--green); }
+textarea.prompt-edit { font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: #101116; line-height: 1.45; }
+.boardsearch { width: 100%; max-width: 480px; }
+.emptypanel { border-color: var(--amber); }
+@media (max-width: 760px) { .boardsearch { max-width: none; } }
