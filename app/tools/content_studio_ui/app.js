@@ -161,8 +161,12 @@ function viewBoard() {
       if (t.pending.extract_facts) next.push(h("span", { class: "chip action", onclick: () => go(`#/topic/${t.id}?do=extract_facts`) }, `${t.pending.extract_facts} sources need facts`));
       if (t.pending.draft_questions) next.push(h("span", { class: "chip action", onclick: () => go(`#/topic/${t.id}?do=draft_questions`) }, `${t.pending.draft_questions} facts need questions`));
       if (t.pending.make_variants) next.push(h("span", { class: "chip action", onclick: () => go(`#/topic/${t.id}?do=make_variants`) }, `${t.pending.make_variants} approved q's have no variants`));
-      rows.push(h("tr", {},
-        h("td", {}, h("a", { onclick: () => go(`#/topic/${t.id}`) }, t.name)),
+      const ck = t.check;
+      if (ck.issues) next.push(h("span", { class: "chip action", onclick: () => go(`#/topic/${t.id}`) }, `${ck.issues} with accuracy issues`));
+      if (ck.stale) next.push(h("span", { class: "chip action", onclick: () => go(`#/topic/${t.id}`) }, `${ck.stale} changed since checked`));
+      if (ck.unchecked) next.push(h("span", { class: "chip action", onclick: () => go(`#/topic/${t.id}`) }, `${ck.unchecked} to check`));
+      rows.push(h("tr", { "data-q": `${t.name} ${t.department}`.toLowerCase() },
+        h("td", {}, h("a", { onclick: () => go(`#/topic/${t.id}`) }, t.name), t.approved ? h("span", { class: "chip ok", title: "approved for the game" }, "approved") : null),
         kindCell("source"), kindCell("fact"), kindCell("question"), kindCell("variant"),
         h("td", {}, h("div", { class: "bar" }, h("i", { style: `width:${Math.min(100, t.exportable / t.target * 100)}%` })), h("span", { class: "small muted" }, `${t.exportable} / ${t.target} export-ready`)),
         h("td", {}, miniSpread(t)),
@@ -170,13 +174,37 @@ function viewBoard() {
       ));
     }
   }
+  const tbody = h("tbody", {}, rows);
+  const hits = h("div", {});
+  let timer = null;
+  const search = h("input", { type: "text", placeholder: "Search topics and cards...", class: "boardsearch", oninput: () => {
+    const q = search.value.trim().toLowerCase();
+    let dept = null, shown = 0;
+    const flush = () => { if (dept) dept.style.display = shown || !q ? "" : "none"; };
+    for (const tr of tbody.children) {
+      if (tr.classList.contains("dept")) { flush(); dept = tr; shown = 0; continue; }
+      const on = !q || tr.getAttribute("data-q").includes(q);
+      tr.style.display = on ? "" : "none"; if (on) shown++;
+    }
+    flush();
+    clearTimeout(timer);
+    if (q.length < 2) return hits.replaceChildren();
+    timer = setTimeout(async () => {
+      const r = await guarded(() => api("GET", `/api/search?q=${encodeURIComponent(q)}`));
+      if (!r || search.value.trim().toLowerCase() !== q) return;
+      hits.replaceChildren(r.nodes.length ? h("div", { class: "panel", style: "margin-bottom:14px" }, h("h3", {}, `Cards and facts matching "${q}" (${r.total_nodes})`),
+        r.nodes.map(n => h("div", { class: "item", onclick: () => go(`#/topic/${n.topic}/${n.id}`) }, h("span", { class: "st " + n.status }), h("span", { class: "muted small", style: "min-width:130px" }, n.topic_name),
+          h("span", { class: "badge " + n.kind }, n.kind), h("span", { class: "txt" }, n.snippet || "(empty)")))) : null);
+    }, 250);
+  } });
   $view.replaceChildren(
     h("div", { class: "row", style: "justify-content:space-between;margin-bottom:14px" },
       h("div", {}, h("h1", {}, "Question bank progress"), h("div", { class: "muted" }, `${totalExport} of ${totalTarget} target cards approved and export-ready across ${st.topics.length} topics`,
         st.ideas.length ? [" - ", h("a", { onclick: () => go("#/ideas") }, `${st.ideas.length} idea${st.ideas.length > 1 ? "s" : ""} in the inbox`)] : null)),
       h("div", { class: "muted small" }, "bars: ", h("span", { class: "tag-ok" }, "approved"), " / ", h("span", { style: "color:var(--amber)" }, "draft"), " / rejected")),
+    h("div", { style: "margin-bottom:14px" }, search), hits,
     h("div", { class: "panel" }, h("table", { class: "board boardview" },
-      h("thead", {}, h("tr", {}, ["Topic", "Sources", "Facts", "Questions", "Variants", "Export-ready", "Difficulty", "Next up"].map(x => h("th", {}, x)))), h("tbody", {}, rows))),
+      h("thead", {}, h("tr", {}, ["Topic", "Sources", "Facts", "Questions", "Variants", "Export-ready", "Difficulty", "Next up"].map(x => h("th", {}, x)))), tbody)),
   );
   ui.hooks.refresh = viewBoard;
 }
@@ -191,6 +219,7 @@ async function viewTopic(topicId, nodeId, query) {
   ui.mountedTopic = topicId;
   const listBox = h("div", { class: "list", onscroll: () => { ui.listScroll = listBox.scrollTop; } });
   const detailBox = h("div", {});
+  detailBox.addEventListener("input", () => { ui.dirty = true; });
   const spreadBox = h("div", {});
   const facetBox = h("div", {});
   let nodes = [];
@@ -207,11 +236,28 @@ async function viewTopic(topicId, nodeId, query) {
   topicIns.value = cfg.instructions.topics?.[topic.id] || "";
   const saveIns = () => guarded(async () => { cfg.instructions.topics[topic.id] = topicIns.value; await api("PUT", "/api/config", { instructions: cfg.instructions }); toast("Topic instructions saved"); });
 
+  const t0 = topicOf(topic.id), ck0 = t0.check;
+  const approveBtn = t0.approved
+    ? h("button", { class: "ghost", title: "This topic's approved cards can be exported to the game. Click to take it out.", onclick: () => setApproved(topic, false) }, "\u2713 Approved for the game (click to undo)")
+    : h("button", { class: "good", disabled: !t0.can_approve, title: t0.can_approve ? "" : "Approve at least one question first", onclick: () => setApproved(topic, true) }, "Approve topic for the game");
+  const topicBar = h("div", { class: "row", style: "margin-top:12px" }, approveBtn,
+    aiBar(topic, null, { pendingCheck: ck0.unchecked + ck0.stale, canCheck: ck0.unchecked + ck0.stale + ck0.ok + ck0.issues > 0, canFill: true,
+      hint: [ck0.issues ? `${ck0.issues} with issues` : "", ck0.stale ? `${ck0.stale} changed since checked` : "", ck0.unchecked ? `${ck0.unchecked} unchecked` : ""].filter(Boolean).join(" - ") }),
+    h("button", { class: "ghost", onclick: () => createNode(topic, "source", [], BLANK_SOURCE) }, "+ Add a source by hand"));
+  const seedN = h("input", { type: "number", value: 10, min: 1, max: 40, style: "width:64px" });
+  const emptyPanel = totalNodes(t0) === 0 ? h("div", { class: "panel emptypanel", style: "margin-bottom:14px" },
+    h("h2", {}, "This topic is empty"),
+    h("p", { class: "muted" }, "Let the AI find one source and pull facts out of it, or build everything by hand."),
+    h("div", { class: "row" }, "Facts to pull", seedN,
+      h("button", { class: "primary", onclick: () => runDispatch("fill", topic, null, { count: Math.max(1, +seedN.value || 10) }) }, "Find a source and facts"),
+      h("button", { onclick: () => createNode(topic, "source", [], BLANK_SOURCE) }, "+ Add a source by hand")),
+    h("div", { class: "muted small", style: "margin-top:8px" }, "You will see the exact prompt first and can edit it, e.g. 'only well-known world capitals' or 'keep facts to events after 2000'.")) : null;
   const pipeline = h("div", { class: "panel", style: "margin-bottom:14px" },
     h("div", { class: "row", style: "justify-content:space-between" }, h("div", {}, h("h1", { style: "display:inline" }, h("span", { class: "dot", style: `background:${deptColor(topic.department)}` }), topic.name), h("span", { class: "muted", style: "margin-left:10px" }, `${topic.department} - ${topic.exportable}/${topic.target} export-ready`), topic.stage !== "active" ? h("span", { class: "chip", style: "margin-left:10px" }, topic.stage) : null),
       h("a", { onclick: () => go(topic.stage === "active" ? "#/board" : "#/ideas") }, topic.stage === "active" ? "back to board" : "back to ideas")),
-    h("details", { class: "pipe-details", open: !window.matchMedia("(max-width: 760px)").matches, style: "margin-top:10px" },
-    h("summary", { class: "muted" }, "Run steps and difficulty spread"),
+    topicBar,
+    h("details", { class: "pipe-details", open: false, style: "margin-top:10px" },
+    h("summary", { class: "muted" }, "Batch AI steps and difficulty spread"),
     h("div", { class: "actions", style: "margin-top:12px" },
       stageBtn("opentdb", "1. Import OpenTDB", () => ({}), h("span", { class: "muted small" }, "no AI")),
       stageBtn("find_sources", "2. Find sources", () => ({ count: +nSources.value }), nSources),
@@ -229,9 +275,8 @@ async function viewTopic(topicId, nodeId, query) {
   const pipeDetails = pipeline.querySelector(".pipe-details");
   ui.pipeMq = ui.pipeMq || window.matchMedia("(max-width: 760px)");
   if (ui.pipeSync) ui.pipeMq.removeEventListener("change", ui.pipeSync);
-  ui.pipeSync = () => { pipeDetails.open = !ui.pipeMq.matches; };
+  ui.pipeSync = () => {};
   ui.pipeMq.addEventListener("change", ui.pipeSync);
-  ui.pipeSync();
 
   const kindSel = h("select", { onchange: () => { ui.filters.kind = kindSel.value; renderList(); } }, ["", "source", "fact", "question", "variant"].map(k => h("option", { value: k }, k || "all kinds")));
   kindSel.value = ui.filters.kind;
@@ -239,7 +284,7 @@ async function viewTopic(topicId, nodeId, query) {
   statusSel.value = ui.filters.status;
   const search = h("input", { type: "text", placeholder: "search", value: ui.filters.q, style: "flex:1", oninput: () => { ui.filters.q = search.value; renderList(); } });
 
-  $view.replaceChildren(pipeline, h("div", { class: "topic-layout" + (nodeId ? " has-sel" : "") },
+  $view.replaceChildren(pipeline, ...(emptyPanel ? [emptyPanel] : []), h("div", { class: "topic-layout" + (nodeId ? " has-sel" : "") },
     h("div", { class: "panel tree-panel" }, h("div", { class: "row", style: "margin-bottom:8px" }, kindSel, statusSel, search),
       h("div", { class: "row", style: "margin-bottom:6px" }, h("button", { class: "good", onclick: () => bulkApprove(topic, null, () => reloadAll()) }, "Approve all drafts in topic")), listBox), detailBox));
 
@@ -248,7 +293,7 @@ async function viewTopic(topicId, nodeId, query) {
     const kids = n.child_count;
     return h("div", { class: "item" + (n.id === selected ? " sel" : ""), style: `margin-left:${depth * 18}px`, onclick: () => go(`#/topic/${topic.id}/${n.id}`) },
       h("span", { class: "twisty", onclick: (e) => { e.stopPropagation(); if (!kids) return; ui.collapsed.has(n.id) ? ui.collapsed.delete(n.id) : ui.collapsed.add(n.id); renderList(); } }, kids ? (ui.collapsed.has(n.id) ? "+" : "-") : ""),
-      h("span", { class: "st " + n.status, title: n.status }), badge(n), h("span", { class: "txt" }, n.snippet || "(empty)"), mockFlag(n),
+      h("span", { class: "st " + n.status, title: n.status }), checkDot(n.check, n.has_suggestion), badge(n), h("span", { class: "txt" }, n.snippet || "(empty)"), mockFlag(n),
       kids ? h("span", { class: "kids" }, `${kids} derived`) : null);
   }
   function renderList() {
@@ -267,7 +312,7 @@ async function viewTopic(topicId, nodeId, query) {
       };
       for (const n of nodes) if (!n.parent_ids.some(p => ids.has(p))) walk(n, 0, new Set());
     }
-    listBox.replaceChildren(...(out.length ? out : [h("div", { class: "muted", style: "padding:12px" }, nodes.length ? "Nothing matches the filters." : "No nodes yet. Start with step 1 or 2 above.")]));
+    listBox.replaceChildren(...(out.length ? out : [h("div", { class: "muted", style: "padding:12px" }, nodes.length ? "Nothing matches the filters." : "No nodes yet. Use \"Find a source and facts\" or add a source by hand above.")]));
   }
   async function loadList() { nodes = (await api("GET", `/api/topics/${topic.id}/nodes`)).nodes; renderList(); spreadBox.replaceChildren(spreadPanel(topicOf(topic.id))); renderFacets(); }
   function explanationsRow(t) {
@@ -294,13 +339,21 @@ async function viewTopic(topicId, nodeId, query) {
       explanationsRow(t));
   }
   async function loadDetail() {
+    ui.dirty = false;
     if (!selected) return detailBox.replaceChildren(h("div", { class: "panel muted" }, "Select a node to see its content, lineage and provenance."));
     const d = await guarded(() => api("GET", `/api/nodes/${selected}`));
     if (d) detailBox.replaceChildren(h("a", { class: "only-mobile", style: "display:block;margin-bottom:10px", onclick: () => go(`#/topic/${topic.id}`) }, "< back to list"),
       nodeDetail(d, topicOf(topic.id), async () => { await refreshState(); await loadList(); await loadDetail(); }));
   }
   async function reloadAll() { const at = listBox.scrollTop; await refreshState(); await loadList(); listBox.scrollTop = at; await loadDetail(); }
-  ui.hooks.refresh = async () => { const at = listBox.scrollTop; await refreshState(); await loadList(); listBox.scrollTop = at; };
+  ui.hooks.refresh = async () => {
+    const at = listBox.scrollTop; await refreshState(); await loadList(); listBox.scrollTop = at;
+    if (ui.detailRefresh) {   // a check/fill started from the open card has finished
+      ui.detailRefresh = false;
+      if (ui.dirty) toast("The run finished, but you have unsaved edits here - save, then reopen the card to see the result.");
+      else await loadDetail();
+    }
+  };
   await loadList(); await loadDetail();
   if (keep) { listBox.scrollTop = keep.list; window.scrollTo(0, keep.y); }
   else { const sel = listBox.querySelector(".item.sel"); if (sel) listBox.scrollTop = Math.max(0, sel.offsetTop - listBox.offsetTop - listBox.clientHeight / 3); }
@@ -308,22 +361,76 @@ async function viewTopic(topicId, nodeId, query) {
 }
 
 function showPreview(topic, preview, onRun) {
+  const promptBox = h("textarea", { class: "prompt-edit", rows: 16, spellcheck: false });
+  promptBox.value = preview.prompt;
   const body = h("div", {},
     preview.followup ? h("div", { class: "panel warn", style: "margin-bottom:12px" }, preview.followup) : null,
     h("div", { class: "kv" }, h("div", {}, "Stage"), h("div", {}, preview.label), h("div", {}, "Backend"), h("div", {}, `${preview.backend}  (model: ${preview.model})`),
       h("div", {}, "Tools"), h("div", {}, preview.tools.length ? preview.tools.join(", ") : "none"), h("div", {}, "Inputs"), h("div", {}, preview.inputs.length ? preview.inputs.map(i => h("div", { class: "small" }, `${i.id}: ${i.snippet.slice(0, 90)}`)) : "n/a")),
-    h("label", {}, "Exact prompt that will be sent"), h("div", { class: "prompt" }, preview.prompt));
-  modal(`Review: ${preview.label} - ${topic.name}`, body, [{ label: "Cancel" }, { label: "Run", cls: "primary", fn: () => guarded(onRun) }]);
+    h("label", {}, "The prompt that will be sent - you can edit it (for example: 'only well-known world capitals'). Keep the Output: line at the end."), promptBox);
+  modal(`Review: ${preview.label} - ${topic.name}`, body, [{ label: "Cancel" }, { label: "Run", cls: "primary", fn: () => guarded(() => onRun(promptBox.value !== preview.prompt ? promptBox.value : undefined)) }]);
 }
 
 async function runStage(topic, stage, params) {
   const preview = await guarded(() => api("POST", "/api/run", { stage, topic: topic.id, params, preview: true }));
   if (!preview) return;
-  showPreview(topic, preview, async () => {
-    await api("POST", "/api/run", { stage, topic: topic.id, params: { ...params, input_ids: preview.input_ids.length ? preview.input_ids : undefined }, preview: false });
+  showPreview(topic, preview, async (edited) => {
+    await api("POST", "/api/run", { stage, topic: topic.id, params: { ...params, input_ids: preview.input_ids.length ? preview.input_ids : undefined }, preview: false, prompt: edited });
     toast(`${preview.label} started`); await poll(); ui.hooks.refresh?.();
   });
 }
+
+// "Check for accuracy" and "Fill in automatically" work at every level: topic (no node), source, fact, question.
+async function runDispatch(kind, topic, nodeId, extra) {
+  const base = { topic: topic.id, node_id: nodeId || undefined, ...(extra || {}) };
+  const preview = await guarded(() => api("POST", `/api/${kind}`, { ...base, preview: true }));
+  if (!preview) return;
+  showPreview(topic, preview, async (edited) => {
+    await api("POST", `/api/${kind}`, { ...base, prompt: edited });
+    toast(`${preview.label} started`); await poll();
+    await ui.hooks.refresh?.();
+    if (nodeId) ui.detailRefresh = true;   // set after the refresh above, so it fires when the run finishes, not now
+  });
+}
+
+const CHECK_LABEL = { unchecked: "not checked", stale: "changed since checked", ok: "checked ok", issues: "has issues" };
+const checkDot = (state, hasSuggestion) => state ? h("span", { class: "ck " + state, title: CHECK_LABEL[state] + (hasSuggestion ? " - a fix is suggested" : "") }, { ok: "\u2713", issues: "!", stale: "\u21BB", unchecked: "\u00B7" }[state]) : null;
+
+function aiBar(topic, node, o) {
+  return h("div", { class: "aibar" },
+    h("button", { disabled: !o.canCheck, title: o.checkHint || "Check the cards here against their facts (only what is new or changed since the last check)", onclick: () => runDispatch("check", topic, node?.id) },
+      "Check for accuracy" + (o.pendingCheck ? ` (${o.pendingCheck})` : "")),
+    h("button", { disabled: !o.canFill, title: o.fillHint || "Fill in whatever is blank here. Never overwrites anything you have written.", onclick: () => runDispatch("fill", topic, node?.id) }, "Fill in automatically"),
+    o.hint ? h("span", { class: "muted small" }, o.hint) : null);
+}
+
+function confirmModal(title, text, yesLabel, yesClass, onYes) {
+  modal(title, h("div", {}, h("p", {}, text)), [{ label: "Cancel" }, { label: yesLabel, cls: yesClass, fn: () => guarded(onYes) }]);
+}
+
+async function deleteNode(topic, node) {
+  const pre = await guarded(() => api("DELETE", `/api/nodes/${node.id}`, { preview: true }));
+  if (!pre) return;
+  const parts = Object.entries(pre.by_kind).map(([k, v]) => `${v} ${k}${v === 1 ? "" : "s"}`).join(", ");
+  confirmModal(pre.children ? `Delete this and ${pre.children} derived item${pre.children === 1 ? "" : "s"}?` : "Delete this permanently?",
+    (pre.children ? `This also deletes: ${parts}. ` : "") + "There is no archive and no undo.", "Delete", "bad",
+    async () => { await api("DELETE", `/api/nodes/${node.id}`, { cascade: true }); toast("Deleted"); go(`#/topic/${topic.id}`); });
+}
+
+async function setApproved(topic, want) {
+  const t = topicOf(topic.id), open = t.check.unchecked + t.check.stale + t.check.issues;
+  const doIt = () => guarded(async () => { await api("PUT", `/api/topics/${topic.id}`, { approved: want }); toast(want ? "Topic approved for the game" : "Topic no longer approved"); route(); });
+  if (want && open) return confirmModal("Approve anyway?", `${open} card${open === 1 ? " is" : "s are"} unchecked, changed since checked, or have unresolved issues. Approve the topic anyway?`, "Approve anyway", "good", doIt);
+  doIt();
+}
+
+async function createNode(topic, kind, parents, payload, variantType) {
+  const r = await guarded(() => api("POST", "/api/nodes", { topic: topic.id, kind, parent_ids: parents, payload, variant_type: variantType }));
+  if (r) go(`#/topic/${topic.id}/${r.node.id}`);
+}
+const BLANK_SOURCE = { source_type: "manual", title: "", url: "", summary: "", excerpt: "", license: "" };
+const BLANK_FACT = { text: "", context: "", difficulty_hint: "intermediate" };
+const BLANK_CARD = { title: "", facet: "", question: "", answer: "", choices: ["", "", "", ""], difficulty: "intermediate", input_type: "multiple_choice" };
 
 // ---------------------------------------------------------------- ideas inbox
 const VERDICTS = {
@@ -546,17 +653,57 @@ function nodeDetail(d, topic, reload) {
       node.history.slice().reverse().map(x => h("div", { class: "small", style: "margin-top:4px" }, `${fmtTime(x.at)} - ${x.action}${x.action === "status" ? `: ${x.from} -> ${x.to}` : ""}`))) : null);
 
   const problems = d.problems.length ? h("div", { class: "warn small", style: "margin-top:8px" }, "Needs fixing before approval: " + d.problems.join("; ")) : null;
-  const canDelete = d.children.length === 0;
+  const ck = d.check || {}, roll = ck.rollup;
+  const approveGuard = () => {
+    const why = { unchecked: "hasn't been checked for accuracy", stale: "changed since its last accuracy check", issues: "was checked and has unresolved issues" }[ck.state];
+    if (isQ && ck.has_fact && why) return confirmModal("Approve anyway?", `This card ${why}.`, "Approve anyway", "good", () => save("approved"));
+    save("approved");
+  };
+  const pendingCheck = isQ ? (ck.state === "unchecked" || ck.state === "stale" ? 1 : 0) : (roll ? roll.unchecked + roll.stale : 0);
+  const aiRow = h("div", { class: "panel", style: "margin-top:12px" }, h("h3", {}, "AI help for this " + node.kind),
+    aiBar(topic, node, isQ
+      ? { pendingCheck, canCheck: !!ck.has_fact, checkHint: ck.has_fact ? "" : "No fact to check against - this card has no parent fact", canFill: (ck.missing || []).length > 0,
+          fillHint: (ck.missing || []).length ? "" : "Nothing is blank on this card", hint: (ck.missing || []).length ? `Blank: ${ck.missing.join(", ")}` : "" }
+      : { pendingCheck, canCheck: !!roll && roll.unchecked + roll.stale + roll.ok + roll.issues > 0, checkHint: "No cards beneath this to check yet",
+          canFill: true, hint: roll ? [roll.issues ? `${roll.issues} with issues` : "", roll.stale ? `${roll.stale} changed since checked` : "", roll.unchecked ? `${roll.unchecked} unchecked` : ""].filter(Boolean).join(" - ") : "" }));
+  const act = (action) => guarded(async () => { await api("POST", `/api/nodes/${node.id}/suggestion`, { action }); await reload(); });
+  const lastHist = node.history[node.history.length - 1];
+  const view = (v) => Array.isArray(v) ? v.join("  |  ") : String(v ?? "");
+  const STATE_TXT = { unchecked: ["Not checked yet", "muted"], stale: ["Changed since the last check", "warn"], ok: ["Checked: consistent with its fact", "tag-ok"], issues: ["Checked: issues found", "err"] };
+  const ckPanel = isQ ? h("div", { class: "panel", style: "margin-top:12px" }, h("h3", {}, "Accuracy check"),
+    h("div", { class: STATE_TXT[ck.state][1] }, STATE_TXT[ck.state][0], ck.record?.at ? h("span", { class: "muted small" }, `  (${fmtTime(ck.record.at)})`) : null),
+    ck.record?.notes ? h("div", { style: "margin-top:6px" }, ck.record.notes) : null,
+    ck.has_fact ? null : h("div", { class: "muted small" }, "This card has no parent fact, so there is nothing to check it against."),
+    ck.suggestion ? h("div", { class: "sug" }, h("div", { class: "small muted" }, "Suggested change - nothing has been applied yet:"),
+      Object.entries(ck.suggestion.fields).map(([k, v]) => h("div", { class: "diff" }, h("div", { class: "small muted" }, k), h("div", { class: "old" }, view(p[k])), h("div", { class: "new" }, view(v)))),
+      h("div", { class: "row", style: "margin-top:8px" }, h("button", { class: "good", onclick: () => act("accept") }, "Accept suggestion"), h("button", { onclick: () => act("dismiss") }, "Dismiss"),
+        h("button", { class: "ghost", onclick: () => act("keep") }, "Keep as written"), h("span", { class: "muted small" }, "Or edit the card yourself and save - that clears the suggestion."))) : null,
+    lastHist?.action === "accept_suggestion" ? h("div", { style: "margin-top:8px" }, h("button", { class: "ghost", onclick: () => act("undo") }, "Undo the accepted suggestion")) : null) : null;
+  let addRow = null;
+  if (node.kind === "source") addRow = h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => createNode(topic, "fact", [node.id], BLANK_FACT) }, "+ Add a fact by hand"));
+  else if (node.kind === "fact") addRow = h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => createNode(topic, "question", [node.id], BLANK_CARD) }, "+ Add a question by hand"));
+  else if (node.kind === "question") {
+    const vsel = h("select", {}, Object.keys(ui.state.variant_types).map(v => h("option", { value: v }, v.replace("_", "/"))));
+    const copy = () => vsel.value === "true_false"
+      ? { ...BLANK_CARD, title: p.title, facet: p.facet, question: p.question, answer: "True", choices: ["True", "False"], difficulty: p.difficulty, input_type: "true_false" }
+      : { ...BLANK_CARD, title: p.title, facet: p.facet, question: p.question, answer: p.answer, choices: [...(p.choices || [])], difficulty: p.difficulty, explanation: p.explanation || "" };
+    addRow = h("div", { class: "panel", style: "margin-top:12px" }, h("h3", {}, "Make a variant of this question"),
+      h("div", { class: "row" }, vsel, h("button", { onclick: () => createNode(topic, "variant", [node.id], copy(), vsel.value) }, "Copy to edit by hand"),
+        h("button", { class: "primary", onclick: () => runStage(topic, "make_variants", { input_ids: [node.id], variant_type: vsel.value, note: "" }) }, "Write it with AI")),
+      h("div", { class: "muted small", style: "margin-top:6px" }, "A variant uses the same fact: easier, harder, reworded or true/false. 'Copy to edit by hand' starts from this question's text."));
+  }
   return h("div", {}, lineage,
     h("div", { class: "panel" },
       h("div", { class: "row", style: "justify-content:space-between" }, h("div", {}, badge(node), h("span", { class: "st " + node.status }), node.status, mockFlag(node), h("span", { class: "mono muted", style: "margin-left:10px" }, node.id)),
         h("div", { class: "actions" },
-          h("button", { class: "good", onclick: () => save("approved") }, "Approve"), h("button", { class: "bad", onclick: () => save("rejected") }, "Reject"),
+          h("button", { class: "good", onclick: approveGuard }, "Approve"), h("button", { class: "bad", onclick: () => save("rejected") }, "Reject"),
           node.status !== "draft" ? h("button", { class: "ghost", onclick: () => save("draft") }, "Back to draft") : null,
           h("button", { class: "primary", onclick: () => save() }, "Save edits"))),
       form, problems,
-      h("div", { style: "margin-top:12px" }, canDelete ? h("button", { class: "ghost bad", onclick: () => confirm("Delete this node permanently?") && guarded(async () => { await api("DELETE", `/api/nodes/${node.id}`); toast("Deleted"); go(`#/topic/${topic.id}`); }) }, "Delete node") : h("span", { class: "muted small" }, "Has derived children, so it can't be deleted - reject it instead."))),
-    moreFacts, writeQs, revise, kids, provPanel);
+      h("div", { style: "margin-top:12px" }, h("button", { class: "ghost bad", onclick: () => deleteNode(topic, node) }, "Delete permanently"))),
+    ckPanel, aiRow, addRow,
+    (moreFacts || writeQs || revise) ? h("details", { class: "panel", style: "margin-top:12px" }, h("summary", { class: "muted" }, "More AI tools (batch and revise)"), moreFacts, writeQs, revise) : null,
+    kids, provPanel);
 }
 
 // ---------------------------------------------------------------- runs

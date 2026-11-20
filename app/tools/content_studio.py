@@ -365,6 +365,13 @@ class Store:
         if changed:
             self.save_config()
 
+    def reconcile_approval(self, topic_id: str) -> None:
+        """A topic stays approved only while it has at least one approved card."""
+        t = self.topic_cfg(topic_id)
+        if t and t.get("approved") and not any(n["topic"] == topic_id and n["kind"] in QUESTION_KINDS and n["status"] == "approved" for n in self.nodes.values()):
+            t["approved"] = False
+            self.save_config()
+
     def save_config(self) -> None:
         with self.lock:
             atomic_write(CONTENT / "config.json", json.dumps(self.config, indent=2, ensure_ascii=False))
@@ -1641,6 +1648,7 @@ def api_update_node(node_id: str, body: dict) -> dict:
         node["history"] = node["history"][-60:]
         node["updated_at"] = now_iso()
         S.save_topic(node["topic"])
+        S.reconcile_approval(node["topic"])
     return api_node(node_id)
 
 
@@ -1734,6 +1742,7 @@ def api_delete_node(node_id: str, body: dict | None = None) -> dict:
         for i in detached:
             S.nodes[i]["parent_ids"] = [p for p in S.nodes[i]["parent_ids"] if p in S.nodes]
         S.save_topic(node["topic"])
+        S.reconcile_approval(node["topic"])
     return {"deleted": sorted(doomed), **info}
 
 
