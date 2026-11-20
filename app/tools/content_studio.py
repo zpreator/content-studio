@@ -1895,6 +1895,15 @@ def api_fill(body: dict) -> dict:
     S = STORE
     t, node = _scope(body)
     params: dict = {"note": clean_str(body.get("note"))}
+    if clean_str(body.get("what")) == "questions":
+        # "Write questions for every fact" under a source/topic (30 per run; run it again for the rest).
+        if node and node["kind"] in (*QUESTION_KINDS, "fact"):
+            raise ApiError(400, "use 'Fill in automatically' on a single fact or card; this writes questions for the facts beneath a source or topic")
+        scope = node["id"] if node else ""
+        if not facts_waiting(t["id"], scope):
+            raise ApiError(400, "every fact here already has a question")
+        params.update(under=scope, limit=max(1, min(int(body.get("limit") or 30), 30)), difficulty=clean_str(body.get("difficulty")))
+        return api_run({"stage": "draft_questions", "topic": t["id"], "params": params, "preview": body.get("preview"), "prompt": body.get("prompt")})
     if node:
         if node["kind"] in QUESTION_KINDS:
             if not fill_missing(node):
