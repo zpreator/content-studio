@@ -3,7 +3,7 @@
 
     python3 tools/content_studio.py            # serves http://127.0.0.1:8765
     python3 tools/content_studio.py --port 9000 --no-open
-    python3 tools/content_studio.py --lan      # also reachable from your phone on the same network (needs the access token)
+    python3 tools/content_studio.py --lan      # also reachable from your phone on the same network (no login; trusted network only)
 
 Everything is a *node* in a lineage graph, stored as plain JSON under
 design/content/ (diff-friendly, lives in git):
@@ -26,11 +26,7 @@ Standard library only; the UI is plain HTML/JS in tools/content_studio_ui/.
 from __future__ import annotations
 
 import argparse
-import getpass
-import hashlib
-import hmac
 import ipaddress
-import secrets
 import socket
 import html
 import json
@@ -1670,38 +1666,13 @@ MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; cha
 # network access
 # --------------------------------------------------------------------------
 # Default: bound to 127.0.0.1, so only this laptop can reach it. With --lan it listens on every
-# interface so a phone on the same Wi-Fi (or a VPN into it) can use it, but every request that
-# doesn't come from this laptop must carry the access token. The token is a long random secret kept
-# in ~/.content_studio_token (outside the repo, mode 600). The phone enters it once through the
-# printed link, which sets a cookie and redirects to a clean URL. There is no HTTPS, so the token is
-# visible to anyone who can sniff your network: fine on home Wi-Fi or a VPN, not on a cafe network.
-# A password can be set with --set-password; /login then signs a device in with it (same cookie as the link,
-# stored hashed with scrypt, wrong guesses are slowed and paused after 10 in 10 minutes).
+# interface. The app has NO login of its own: access control is expected to be enforced in front of
+# it (Cloudflare Access on the public hostname; keep the port off untrusted networks).
 
-TOKEN_FILE = Path(os.environ.get("STUDIO_TOKEN_FILE") or Path.home() / ".content_studio_token")
-COOKIE_NAME = "studio_token"
 LAN_MODE = False
-ACCESS_TOKEN = ""
 # Extra Host names accepted in LAN mode, e.g. "content.example.com" when a tunnel/proxy fronts the studio.
 # Anything else is still refused, so a hostile web page can't reach the studio under a name it controls.
 ALLOWED_HOSTS: set[str] = {h.strip().lower() for h in os.environ.get("STUDIO_ALLOWED_HOSTS", "").split(",") if h.strip()}
-
-
-def load_access_token(rotate: bool = False) -> str:
-    if TOKEN_FILE.exists() and not rotate:
-        token = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        if len(token) >= 20:
-            return token
-    token = secrets.token_urlsafe(18)
-    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(token + "\n")
-    os.chmod(TOKEN_FILE, 0o600)
-    return token
-
-
-def token_ok(candidate: str) -> bool:
-    return bool(candidate) and hmac.compare_digest(candidate.encode("utf-8"), ACCESS_TOKEN.encode("utf-8"))
 
 
 def host_allowed(host_header: str) -> bool:
@@ -1738,76 +1709,6 @@ def lan_addresses() -> list[str]:
     return found
 
 
-PASSWORD_FILE = Path(os.environ.get("STUDIO_PASSWORD_FILE") or Path.home() / ".content_studio_password")
-PASSWORD_MIN = 8
-LOGIN_WINDOW_S, LOGIN_MAX_FAILS = 600, 10   # after 10 wrong passwords in 10 minutes, logins pause (the ?token= link still works)
-_login_fails: list[float] = []
-_login_lock = threading.Lock()
-
-
-def hash_password(password: str, salt: bytes | None = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
-    return f"scrypt${salt.hex()}${digest.hex()}"
-
-
-def password_ok(candidate: str) -> bool:
-    try:
-        _, salt_hex, digest_hex = PASSWORD_FILE.read_text(encoding="utf-8").strip().split("$")
-        expected = bytes.fromhex(digest_hex)
-        got = hashlib.scrypt(candidate.encode("utf-8"), salt=bytes.fromhex(salt_hex), n=2 ** 14, r=8, p=1, dklen=32)
-    except (OSError, ValueError):
-        return False
-    return hmac.compare_digest(got, expected)
-
-
-def set_password_interactively() -> None:
-    first = getpass.getpass("New studio password: ")
-    if len(first) < PASSWORD_MIN:
-        sys.exit(f"Use at least {PASSWORD_MIN} characters.")
-    if getpass.getpass("Again: ") != first:
-        sys.exit("Those didn't match; nothing changed.")
-    fd = os.open(PASSWORD_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(hash_password(first) + "\n")
-    os.chmod(PASSWORD_FILE, 0o600)
-    print(f"Password saved to {PASSWORD_FILE}. Phones sign in at /login (already signed-in devices stay signed in).")
-
-
-def login_locked() -> bool:
-    with _login_lock:
-        cutoff = time.time() - LOGIN_WINDOW_S
-        _login_fails[:] = [t for t in _login_fails if t > cutoff]
-        return len(_login_fails) >= LOGIN_MAX_FAILS
-
-
-def login_page(message: str = "") -> bytes:
-    note = f"<p class=err>{html.escape(message)}</p>" if message else ""
-    if not PASSWORD_FILE.exists():
-        note = "<p class=err>No password is set on this studio yet. Open the access link instead, or set one with --set-password.</p>"
-    return (
-        "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<meta name=color-scheme content='dark light'><title>Content Studio - sign in</title>"
-        "<style>:root{--bg:#14151a;--card:#1d1f27;--text:#e6e6ea;--muted:#9a9ca8;--line:#2e313c;--accent:#e0a458;--err:#ff8a80}"
-        "@media (prefers-color-scheme:light){:root{--bg:#f4f1ea;--card:#fff;--text:#22232a;--muted:#6b6d78;--line:#d9d5ca;--accent:#9a5b00;--err:#b3261e}}"
-        "*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif;padding:16px}"
-        "form{width:100%;max-width:340px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px}"
-        "h1{font-size:20px;margin:0 0 4px}p{margin:0 0 16px;color:var(--muted);font-size:14px}p.err{color:var(--err)}"
-        "input{width:100%;font:inherit;padding:11px 12px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--text)}"
-        "button{width:100%;margin-top:14px;font:inherit;font-weight:600;padding:11px;border:0;border-radius:9px;background:var(--accent);color:#1a1205}</style>"
-        "<form method=post action=/login><h1>Content Studio</h1><p>Sign in to continue.</p>" + note +
-        "<input type=text name=username value=studio autocomplete=username hidden>"
-        "<input type=password name=password autocomplete=current-password placeholder=Password autofocus required>"
-        "<button type=submit>Sign in</button></form></html>"
-    ).encode("utf-8")
-
-
-UNAUTHORIZED_PAGE = (b"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-                     b"<body style='font:16px system-ui;background:#14151a;color:#e6e6ea;padding:28px;line-height:1.5'>"
-                     b"<h2>Content Studio</h2><p><a href=/login style=color:#e0a458>Sign in</a>, or open the full access link "
-                     b"(it ends in <code>?token=...</code>).</p></body>")
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "ContentStudio/1.0"
 
@@ -1828,82 +1729,10 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, obj) -> None:
         self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
-    def _from_this_laptop(self) -> bool:
-        try:
-            return ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            return False
-
-    def _cookie_token(self) -> str:
-        for part in (self.headers.get("Cookie") or "").split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE_NAME:
-                return value
-        return ""
-
-    def _session_cookie(self) -> str:
-        https = "https" in (self.headers.get("X-Forwarded-Proto") or "").lower() or "https" in (self.headers.get("CF-Visitor") or "").lower()
-        return f"{COOKIE_NAME}={ACCESS_TOKEN}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000" + ("; Secure" if https else "")
-
-    def _redirect(self, where: str, cookie: str = "") -> None:
-        self.send_response(302)
-        self.send_header("Location", where)
-        if cookie:
-            self.send_header("Set-Cookie", cookie)
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _login(self, method: str) -> None:
-        signed_in = not LAN_MODE or self._from_this_laptop() or token_ok(self._cookie_token())
-        if method == "GET":
-            return self._redirect("/") if signed_in else self._send(200, login_page(), "text/html; charset=utf-8")
-        if "application/x-www-form-urlencoded" not in (self.headers.get("Content-Type") or ""):
-            return self._json(415, {"error": "form post only"})
-        raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 4096)).decode("utf-8", "replace")
-        password = urllib.parse.parse_qs(raw).get("password", [""])[0]
-        if login_locked():
-            return self._send(429, login_page("Too many wrong passwords. Try again in a few minutes."), "text/html; charset=utf-8")
-        if password_ok(password):
-            return self._redirect("/", self._session_cookie())
-        with _login_lock:
-            _login_fails.append(time.time())
-        time.sleep(1.0)  # slow down guessing
-        self._send(401, login_page("That password isn't right."), "text/html; charset=utf-8")
-
-    def _logout(self) -> None:
-        self._redirect("/login", f"{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
-
-    def _authorised(self, parsed) -> bool:
-        """True if the request may proceed; otherwise a response has already been sent."""
-        if not LAN_MODE or self._from_this_laptop():
-            return True
-        supplied = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
-        if supplied:
-            if token_ok(supplied):  # first visit from a new device: set the cookie, then drop the token from the URL
-                self._redirect("/", self._session_cookie())
-                return False
-            time.sleep(0.5)  # slow down guessing
-        elif token_ok(self._cookie_token()):
-            return True
-        if parsed.path.startswith("/api/"):
-            self._json(401, {"error": "access token required"})
-        elif parsed.path == "/":
-            self._redirect("/login")
-        else:
-            self._send(401, UNAUTHORIZED_PAGE, "text/html; charset=utf-8")
-        return False
-
     def _handle(self, method: str) -> None:
         if not host_allowed(self.headers.get("Host") or ""):
             return self._json(403, {"error": "unexpected Host header"})
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/login" and method in ("GET", "POST"):
-            return self._login(method)
-        if parsed.path == "/logout" and method == "POST":
-            return self._logout()
-        if not self._authorised(parsed):
-            return
         path = parsed.path
         if method == "GET" and path in STATIC:
             file = UI_DIR / STATIC[path]
@@ -1946,21 +1775,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global STORE, RUNNER, LAN_MODE, ACCESS_TOKEN
+    global STORE, RUNNER, LAN_MODE
     sys.stdout.reconfigure(line_buffering=True)  # show the banner and links promptly even when output goes to a log file
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-open", action="store_true", help="don't open a browser tab")
-    parser.add_argument("--lan", action="store_true", help="also listen on your local network (phone access); other devices need the access token")
+    parser.add_argument("--lan", action="store_true", help="also listen on your local network (phone access); there is no login, so keep it on a trusted network")
     parser.add_argument("--allow-host", action="append", default=[], metavar="NAME",
-                        help="also accept this Host name (repeatable), e.g. a public hostname behind a tunnel; keeps the token out of the log banner")
-    parser.add_argument("--rotate-token", action="store_true", help="generate a new access token (signs out every phone), then continue")
-    parser.add_argument("--set-password", action="store_true", help="choose the password for the /login page (stored hashed in the password file), then exit")
+                        help="also accept this Host name (repeatable), e.g. a public hostname behind a tunnel")
     parser.add_argument("--import-game-data", action="store_true", help="import existing data/*/curriculum.json cards, then exit")
     args = parser.parse_args()
-    if args.set_password:
-        return set_password_interactively()
-
     STORE = Store()
     RUNNER = Runner()
     if args.import_game_data or not any(STORE.nodes.values()):
@@ -1969,19 +1793,17 @@ def main() -> None:
             return
     LAN_MODE = args.lan
     ALLOWED_HOSTS.update(h.strip().lower() for h in args.allow_host if h.strip())
-    if LAN_MODE:
-        ACCESS_TOKEN = load_access_token(args.rotate_token)
     server = ThreadingHTTPServer(("0.0.0.0" if LAN_MODE else "127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"Content Studio running at {url}  (Ctrl+C to stop)")
     if LAN_MODE and ALLOWED_HOSTS:
-        print(f"\nServer mode: answering to {', '.join(sorted(ALLOWED_HOSTS))}. Other devices need the access token stored in {TOKEN_FILE} (not printed here).\n")
+        print(f"\nServer mode: answering to {', '.join(sorted(ALLOWED_HOSTS))}. No login: access control is handled upstream.\n")
     elif LAN_MODE:
-        print("\nLAN mode ON. On your phone (same Wi-Fi, or VPN) open one of these once; it remembers you afterwards:")
+        print("\nLAN mode ON (no login). Reachable on:")
         names = lan_addresses() + ([socket.gethostname()] if socket.gethostname().endswith(".local") else [])
         for name in names:
-            print(f"  http://{name}:{args.port}/?token={ACCESS_TOKEN}")
-        print(f"The token lives in {TOKEN_FILE} (run with --rotate-token to replace it). macOS may ask whether Python can accept incoming connections: choose Allow.\n")
+            print(f"  http://{name}:{args.port}/")
+        print("Only use this on a network you trust. macOS may ask whether Python can accept incoming connections: choose Allow.\n")
     if not args.no_open:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

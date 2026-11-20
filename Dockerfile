@@ -14,14 +14,13 @@ RUN curl -fsSL https://claude.ai/install.sh | bash && claude --version
 WORKDIR /app
 COPY --chown=studio:studio app/ /app/
 
-# Everything that changes lives in volumes (see docker-compose.yml): content, exported game data, the access token, Claude's login.
+# Everything that changes lives in volumes (see docker-compose.yml): content, exported game data, Claude's login.
 ENV CLAUDE_CONFIG_DIR=/config \
     STUDIO_CONTENT_DIR=/app/content \
-    STUDIO_DATA_DIR=/app/data \
-    STUDIO_TOKEN_FILE=/secrets/access_token STUDIO_PASSWORD_FILE=/secrets/password
+    STUDIO_DATA_DIR=/app/data
 
 EXPOSE 3000
-# Loopback requests need no token, so the health check can ask the API directly.
+# The health check asks the API directly on loopback.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/api/state', timeout=4)"
 
