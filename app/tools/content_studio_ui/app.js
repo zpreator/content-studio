@@ -9,6 +9,10 @@ const INPUT_TYPES = ["multiple_choice", "true_false", "order", "matching", "slid
 const $view = document.getElementById("view");
 const ui = { ideaDraft: { name: "", dept: "", note: "" }, state: null, hooks: { refresh: null }, collapsed: new Set(), filters: { kind: "", status: "", q: "" }, runStatus: {}, lastActive: 0 };
 
+ui.prefs = (() => { try { return { attention: true, advance: true, ...JSON.parse(localStorage.getItem("studio.prefs") || "{}") }; } catch (_) { return { attention: true, advance: true }; } })();
+ui.navs = []; ui.keys = null; ui.curCard = null; ui.cardOrder = [];
+const savePrefs = () => { try { localStorage.setItem("studio.prefs", JSON.stringify(ui.prefs)); } catch (_) { /* private mode: preferences just won't persist */ } };
+
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(props || {})) {
@@ -68,7 +72,7 @@ function parseHash() {
 const go = (hash) => { if (location.hash === hash) route(); else location.hash = hash; };
 
 async function route() {
-  ui.hooks.refresh = null;
+  ui.hooks.refresh = null; ui.keys = null; ui.curCard = null;
   await refreshState();
   const { parts, query } = parseHash();
   renderNav(parts[0] || "board");
@@ -322,7 +326,7 @@ async function viewTopic(topicId, nodeId, query) {
     }
     listBox.replaceChildren(...(out.length ? out : [h("div", { class: "muted", style: "padding:12px" }, nodes.length ? "Nothing matches the filters." : "No nodes yet. Use \"Find a source and facts\" or add a source by hand above.")]));
   }
-  async function loadList() { nodes = (await api("GET", `/api/topics/${topic.id}/nodes`)).nodes; renderTop(); renderList(); spreadBox.replaceChildren(spreadPanel(topicOf(topic.id))); renderFacets(); }
+  async function loadList() { nodes = (await api("GET", `/api/topics/${topic.id}/nodes`)).nodes; ui.cardOrder = cardOrder(nodes); ui.navs.forEach(f => f()); renderTop(); renderList(); spreadBox.replaceChildren(spreadPanel(topicOf(topic.id))); renderFacets(); }
   function explanationsRow(t) {
     const ex = t.explanations || { written: 0, verified: 0, missing: 0 };
     return h("div", { style: "margin-top:12px" }, h("h3", {}, "Explanations (the 'did you know' line)"),
@@ -564,12 +568,77 @@ async function bulkApprove(topic, nodeId, after) {
     }) }]);
 }
 
+// ---------------------------------------------------------------- card navigation
+// Cards in the order the tree shows them (source > fact > question > variant), rejected ones left out.
+function cardOrder(nodes) {
+  const ids = new Set(nodes.map(n => n.id)), byParent = {}, out = [], seen = new Set();
+  for (const n of nodes) for (const p of n.parent_ids) (byParent[p] ||= []).push(n);
+  const walk = (n) => {
+    if (seen.has(n.id)) return; seen.add(n.id);
+    if ((n.kind === "question" || n.kind === "variant") && n.status !== "rejected") out.push(n);
+    for (const c of byParent[n.id] || []) walk(c);
+  };
+  for (const n of nodes) if (!n.parent_ids.some(p => ids.has(p))) walk(n);
+  return out;
+}
+// A card needs attention if it is still a draft, or has a fact but hasn't been (re)checked clean.
+const needsAttention = (n) => n.status === "draft" || (n.has_fact && ["unchecked", "stale", "issues"].includes(n.check));
+function navTarget(cur, dir) {
+  const list = ui.cardOrder || [], i = list.findIndex(n => n.id === cur);
+  for (let k = (i < 0 ? (dir > 0 ? -1 : list.length) : i) + dir; k >= 0 && k < list.length; k += dir) if (!ui.prefs.attention || needsAttention(list[k])) return list[k];
+  return null;
+}
+async function stepCard(dir, quiet) {
+  const cur = ui.curCard; if (!cur) return;
+  const t = navTarget(cur, dir);
+  if (!t) { if (!quiet) toast(dir > 0 ? (ui.prefs.attention ? "No more cards need attention." : "That was the last card.") : "This is the first card."); return; }
+  if (ui.dirty && ui.saveCurrent && !(await ui.saveCurrent())) return;   // never lose typed edits when moving on
+  window.scrollTo(0, 0);
+  go(`#/topic/${ui.curTopic}/${t.id}`);
+}
+function cardNav(cur, where) {
+  const box = h("div", { class: "cardnav " + where });
+  const render = () => {
+    const list = ui.cardOrder || [], i = list.findIndex(n => n.id === cur), prev = navTarget(cur, -1), next = navTarget(cur, 1);
+    const attCb = h("input", { type: "checkbox", checked: !!ui.prefs.attention, onchange: () => { ui.prefs.attention = attCb.checked; savePrefs(); ui.navs.forEach(f => f()); } });
+    box.replaceChildren(
+      h("button", { class: "big", disabled: !prev, title: "Previous card (K or left arrow)", onclick: () => stepCard(-1) }, "\u2190 Previous"),
+      h("div", { class: "pos" }, h("div", { class: "where" }, i >= 0 ? `Card ${i + 1} of ${list.length}` : `${list.length} cards`),
+        h("label", { class: "small" }, attCb, ` only cards needing attention (${list.filter(needsAttention).length})`),
+        where === "top" ? h("a", { class: "small", onclick: showShortcuts }, "keyboard shortcuts (?)") : null),
+      h("button", { class: "big primary", disabled: !next, title: "Next card (J or right arrow)", onclick: () => stepCard(1) }, "Next \u2192"));
+  };
+  ui.navs.push(render); render();
+  return box;
+}
+function showShortcuts() {
+  const rows = [["J or \u2192", "Next card"], ["K or \u2190", "Previous card"], ["A", "Approve (then move on, if enabled below)"], ["C", "Check for accuracy"], ["F", "Fill in automatically"],
+    ["1 - 5", "Set difficulty: beginner, easy, intermediate, advanced, expert"], ["Ctrl+S", "Save edits (also works while typing)"], ["?", "Show this list"]];
+  const pref = (key, label) => { const cb = h("input", { type: "checkbox", checked: !!ui.prefs[key], onchange: () => { ui.prefs[key] = cb.checked; savePrefs(); ui.navs.forEach(f => f()); } }); return h("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text);margin-top:10px" }, cb, label); };
+  modal("Keyboard shortcuts", h("div", {},
+    h("div", { class: "kv", style: "grid-template-columns:90px 1fr" }, rows.map(([k, v]) => [h("div", { class: "mono" }, k), h("div", {}, v)])),
+    pref("attention", "Next / Previous skip cards that don't need attention"), pref("advance", "Move on to the next card after approving"),
+    h("div", { class: "muted small", style: "margin-top:10px" }, "Letter and number shortcuts are off while you are typing in a field.")), [{ label: "Close" }]);
+}
+document.addEventListener("keydown", (e) => {
+  const k = ui.keys;
+  if (!k || document.getElementById("modal-root").childNodes.length) return;
+  const el = e.target;
+  const typing = el && (el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable || (el.tagName === "INPUT" && !["checkbox", "radio", "button"].includes(el.type)));
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); k.save(); return; }
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  const act = { ArrowRight: k.next, ArrowLeft: k.prev, "?": k.help }[e.key] || { j: k.next, k: k.prev, a: k.approve, c: k.check, f: k.fill }[e.key.toLowerCase()];
+  if (act) { e.preventDefault(); act(); }
+  else if (/^[1-5]$/.test(e.key)) { e.preventDefault(); k.diff(+e.key - 1); }
+});
+
 // ---------------------------------------------------------------- node detail
 function nodeLine(n, topicId) {
   return h("div", { class: "item", onclick: () => go(`#/topic/${topicId}/${n.id}`) }, h("span", { class: "st " + n.status }), badge(n), h("span", { class: "txt" }, n.snippet || "(empty)"), mockFlag(n));
 }
 
 function nodeDetail(d, topic, reload) {
+  ui.navs = [];
   const node = d.node, p = node.payload;
   const isQ = node.kind === "question" || node.kind === "variant";
   const fields = {};
@@ -621,6 +690,9 @@ function nodeDetail(d, topic, reload) {
     await api("PUT", `/api/nodes/${node.id}`, body); toast(status ? `Marked ${status}` : "Saved"); await reload();
   });
 
+  const saveQuiet = async () => {   // used when moving to another card: save without re-rendering this one
+    try { await api("PUT", `/api/nodes/${node.id}`, { payload: collect() }); ui.dirty = false; return true; } catch (e) { toast(e.message, true); return false; }
+  };
   const reviseNote = h("textarea", { rows: 2, placeholder: "What should change? e.g. 'make the distractors closer in era' or 'too easy, ask about the year instead'" });
   const revise = isQ ? h("div", { class: "panel", style: "margin-top:12px" }, h("h3", {}, "Revise with AI"), reviseNote,
     h("div", { style: "margin-top:6px" }, h("button", { onclick: () => runStage(topic, "revise", { input_ids: [node.id], note: reviseNote.value }) }, "Revise (creates a child variant)"))) : null;
@@ -667,10 +739,11 @@ function nodeDetail(d, topic, reload) {
 
   const problems = d.problems.length ? h("div", { class: "warn small", style: "margin-top:8px" }, "Needs fixing before approval: " + d.problems.join("; ")) : null;
   const ck = d.check || {}, roll = ck.rollup;
+  const approve = async () => { await save("approved"); if (isQ && ui.prefs.advance) stepCard(1, true); };
   const approveGuard = () => {
     const why = { unchecked: "hasn't been checked for accuracy", stale: "changed since its last accuracy check", issues: "was checked and has unresolved issues" }[ck.state];
-    if (isQ && ck.has_fact && why) return confirmModal("Approve anyway?", `This card ${why}.`, "Approve anyway", "good", () => save("approved"));
-    save("approved");
+    if (isQ && ck.has_fact && why) return confirmModal("Approve anyway?", `This card ${why}.`, "Approve anyway", "good", approve);
+    approve();
   };
   const pendingCheck = isQ ? (ck.state === "unchecked" || ck.state === "stale" ? 1 : 0) : (roll ? roll.unchecked + roll.stale : 0);
   const aiRow = h("div", { class: "panel", style: "margin-top:12px" }, h("h3", {}, "AI help for this " + node.kind),
@@ -692,6 +765,13 @@ function nodeDetail(d, topic, reload) {
       h("div", { class: "row", style: "margin-top:8px" }, h("button", { class: "good", onclick: () => act("accept") }, "Accept suggestion"), h("button", { onclick: () => act("dismiss") }, "Dismiss"),
         h("button", { class: "ghost", onclick: () => act("keep") }, "Keep as written"), h("span", { class: "muted small" }, "Or edit the card yourself and save - that clears the suggestion."))) : null,
     lastHist?.action === "accept_suggestion" ? h("div", { style: "margin-top:8px" }, h("button", { class: "ghost", onclick: () => act("undo") }, "Undo the accepted suggestion")) : null) : null;
+  ui.curCard = isQ ? node.id : null; ui.curTopic = topic.id; ui.saveCurrent = isQ ? saveQuiet : null;
+  ui.keys = isQ ? {
+    next: () => stepCard(1), prev: () => stepCard(-1), approve: approveGuard, save: () => save(), help: showShortcuts,
+    check: () => ck.has_fact ? runDispatch("check", topic, node.id) : toast("This card has no fact to check against", true),
+    fill: () => (ck.missing || []).length ? runDispatch("fill", topic, node.id) : toast("Nothing is blank on this card"),
+    diff: (i) => { const sel = fields.difficulty; if (!sel) return; sel.value = tierNames()[i]; ui.dirty = true; toast(`Difficulty: ${sel.value} - Ctrl+S or Next saves it`); },
+  } : null;
   let addRow = null;
   if (node.kind === "source") addRow = h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => createNode(topic, "fact", [node.id], BLANK_FACT) }, "+ Add a fact by hand"));
   else if (node.kind === "fact") addRow = h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => createNode(topic, "question", [node.id], BLANK_CARD) }, "+ Add a question by hand"));
@@ -705,7 +785,7 @@ function nodeDetail(d, topic, reload) {
         h("button", { class: "primary", onclick: () => runStage(topic, "make_variants", { input_ids: [node.id], variant_type: vsel.value, note: "" }) }, "Write it with AI")),
       h("div", { class: "muted small", style: "margin-top:6px" }, "A variant uses the same fact: easier, harder, reworded or true/false. 'Copy to edit by hand' starts from this question's text."));
   }
-  return h("div", {}, lineage,
+  return h("div", {}, isQ ? cardNav(node.id, "top") : null, lineage,
     h("div", { class: "panel" },
       h("div", { class: "row", style: "justify-content:space-between" }, h("div", {}, badge(node), h("span", { class: "st " + node.status }), node.status, mockFlag(node), h("span", { class: "mono muted", style: "margin-left:10px" }, node.id)),
         h("div", { class: "actions" },
@@ -716,7 +796,7 @@ function nodeDetail(d, topic, reload) {
       h("div", { style: "margin-top:12px" }, h("button", { class: "ghost bad", onclick: () => deleteNode(topic, node) }, "Delete permanently"))),
     ckPanel, aiRow, addRow,
     (moreFacts || writeQs || revise) ? h("details", { class: "panel", style: "margin-top:12px" }, h("summary", { class: "muted" }, "More AI tools (batch and revise)"), moreFacts, writeQs, revise) : null,
-    kids, provPanel);
+    kids, provPanel, isQ ? cardNav(node.id, "bottom") : null);
 }
 
 // ---------------------------------------------------------------- runs

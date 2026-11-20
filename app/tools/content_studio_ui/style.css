@@ -143,3 +143,17 @@ textarea.prompt-edit { font-family: ui-monospace, Menlo, monospace; font-size: 1
 .boardsearch { width: 100%; max-width: 480px; }
 .emptypanel { border-color: var(--amber); }
 @media (max-width: 760px) { .boardsearch { max-width: none; } }
+
+/* step 3: previous / next */
+.cardnav { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 0 0 12px; padding: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
+.cardnav.bottom { margin: 12px 0 0; }
+.cardnav .pos { text-align: center; flex: 1; min-width: 0; }
+.cardnav .pos .where { font-weight: 600; }
+.cardnav .pos label { display: block; margin: 3px 0 0; cursor: pointer; }
+.cardnav .pos label input { margin-right: 4px; vertical-align: middle; }
+button.big { min-height: 48px; min-width: 132px; font-size: 16px; font-weight: 600; }
+@media (max-width: 760px) {
+  .cardnav { padding: 8px; gap: 8px; }
+  button.big { min-width: 96px; padding: 6px 10px; }
+  .cardnav.bottom { position: sticky; bottom: 0; z-index: 5; margin: 12px -12px -12px; border-radius: 0; border-left: none; border-right: none; box-shadow: 0 -6px 14px rgba(0,0,0,.35); }
+}
