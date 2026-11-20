@@ -26,6 +26,7 @@ Standard library only; the UI is plain HTML/JS in tools/content_studio_ui/.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import socket
 import html
@@ -77,6 +78,10 @@ VET_MIN_DOMAINS = 2
 KINDS = ("source", "fact", "question", "variant")
 STATUSES = ("draft", "approved", "rejected")
 QUESTION_KINDS = ("question", "variant")
+# Fields whose change makes an earlier accuracy check out of date, per node kind.
+CHECK_FIELDS = {"source": ("title", "url", "summary", "excerpt"), "fact": ("text", "context"),
+                "question": ("question", "answer", "choices", "explanation"), "variant": ("question", "answer", "choices", "explanation")}
+SUGGEST_FIELDS = ("question", "answer", "choices", "explanation")   # the only fields an accuracy check may propose changing
 
 VARIANT_TYPES = {
     "paraphrase": "Rewrite the question with clearly different wording and sentence structure (not a synonym swap). Same fact, same difficulty. Use a different set of distractors where you can; the correct answer must stay correct.",
@@ -289,6 +294,7 @@ class Store:
         self.runs: dict[str, dict] = {}
         self.config = self._load_or_seed_config()
         self._load_all()
+        self._migrate_topic_approval()
 
     # -- config ------------------------------------------------------------
     def _load_or_seed_config(self) -> dict:
@@ -347,6 +353,17 @@ class Store:
                 "folder": folder, "target": 24, "opentdb": {"categories": cats, "keywords": words},
             })
         return topics
+
+    def _migrate_topic_approval(self) -> None:
+        """Topics gained an explicit 'approved' flag. Existing active topics that already have approved cards keep exporting."""
+        changed = False
+        for t in self.config["topics"]:
+            if "approved" not in t:
+                t["approved"] = t.get("stage", "active") == "active" and any(
+                    n["topic"] == t["id"] and n["kind"] in QUESTION_KINDS and n["status"] == "approved" for n in self.nodes.values())
+                changed = True
+        if changed:
+            self.save_config()
 
     def save_config(self) -> None:
         with self.lock:
@@ -489,6 +506,8 @@ class Store:
             "origin": prov.get("origin"), "mock": bool(prov.get("mock")), "created_at": node["created_at"],
             "difficulty": node["payload"].get("difficulty") or node["payload"].get("difficulty_hint"),
             "input_type": node["payload"].get("input_type"), "source_type": node["payload"].get("source_type"),
+            "check": check_state(node) if node["kind"] in QUESTION_KINDS else None,
+            "has_suggestion": bool(node.get("suggestion")),
         }
 
     # -- summaries ---------------------------------------------------------
@@ -515,7 +534,10 @@ class Store:
         )
         targets = tier_targets(topic_cfg.get("target", 24))
         spread = {name: {**c, "target": targets[name]} for name, c in spread_counts(tid).items()}
-        out = {**topic_cfg, "stage": topic_cfg.get("stage", "active"), "counts": counts, "pending": pending, "exportable": exportable, "spread": spread}
+        approved_cards = sum(1 for n in nodes if n["kind"] in QUESTION_KINDS and n["status"] == "approved")
+        out = {**topic_cfg, "stage": topic_cfg.get("stage", "active"), "counts": counts, "pending": pending, "exportable": exportable, "spread": spread,
+               "approved": bool(topic_cfg.get("approved")), "approved_cards": approved_cards, "can_approve": approved_cards >= 1,
+               "check": check_rollup(nodes)}
         facets = topic_cfg.get("facets") or []
         card_nodes = [n for n in nodes if n["kind"] in QUESTION_KINDS and n["status"] != "rejected"]
         out["facets"] = facets
@@ -534,6 +556,74 @@ STORE: Store
 
 
 # --------------------------------------------------------------------------
+# accuracy checks: what a check covers and when it goes stale
+# --------------------------------------------------------------------------
+
+def fingerprint(node: dict) -> str:
+    """A short hash of the content a check would care about (not status, difficulty or labels)."""
+    p = node["payload"]
+    data = {k: (sorted(clean_str(c) for c in (p.get(k) or [])) if k == "choices" else clean_str(p.get(k))) for k in CHECK_FIELDS[node["kind"]]}
+    return hashlib.sha1(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+
+
+def fact_ancestors(node: dict) -> list[dict]:
+    return [a for a in STORE.ancestors_of(node["id"]) if a["kind"] == "fact"]
+
+
+def check_basis(node: dict) -> str:
+    """The card plus the facts it rests on: if either changes, a past check no longer applies."""
+    return "|".join([fingerprint(node)] + [fingerprint(f) for f in fact_ancestors(node)])
+
+
+def check_state(node: dict) -> str:
+    """unchecked | stale | ok | issues, for a question or variant."""
+    c = node.get("check")
+    if not c:
+        return "unchecked"
+    if c.get("basis") != check_basis(node):
+        return "stale"
+    return c["verdict"] if c.get("verdict") in ("ok", "issues") else "unchecked"
+
+
+def needs_check(node: dict) -> bool:
+    return (node["kind"] in QUESTION_KINDS and node["status"] != "rejected" and bool(fact_ancestors(node))
+            and check_state(node) in ("unchecked", "stale"))
+
+
+def check_rollup(nodes: list[dict]) -> dict:
+    out = {"unchecked": 0, "stale": 0, "ok": 0, "issues": 0, "unsourced": 0}
+    for n in nodes:
+        if n["kind"] not in QUESTION_KINDS or n["status"] == "rejected":
+            continue
+        if not fact_ancestors(n):
+            out["unsourced"] += 1
+        else:
+            out[check_state(n)] += 1
+    return out
+
+
+def fill_missing(node: dict) -> list[str]:
+    """Which parts of a card are still blank (what 'fill in automatically' may write; it never overwrites)."""
+    p, facets = node["payload"], topic_facets(node["topic"])
+    missing = []
+    if facets and not clean_str(p.get("facet")):
+        missing.append("facet")
+    elif not facets and not clean_str(p.get("title")):
+        missing.append("title")
+    if not clean_str(p.get("question")):
+        missing.append("question")
+    if not clean_str(p.get("answer")):
+        missing.append("answer")
+    if p.get("input_type") != "true_false":
+        have = [c for c in (p.get("choices") or []) if clean_str(c)]
+        if len(have) < 4 or (clean_str(p.get("answer")) and clean_str(p.get("answer")).lower() not in [clean_str(c).lower() for c in have]):
+            missing.append("choices")
+    if not clean_str(p.get("explanation")):
+        missing.append("explanation")
+    return missing
+
+
+# --------------------------------------------------------------------------
 # prompts
 # --------------------------------------------------------------------------
 
@@ -549,6 +639,9 @@ STAGE_LABELS = {
     "suggest_facets": "Suggest facets",
     "assign_facets": "Assign facets to cards",
     "add_explanations": "Add explanations",
+    "seed_topic": "Find a source and facts",
+    "check_accuracy": "Check accuracy",
+    "fill_card": "Fill in blanks",
 }
 STAGE_TOOLS = {
     "find_sources": ["WebSearch", "WebFetch"],
@@ -559,6 +652,9 @@ STAGE_TOOLS = {
     "suggest_facets": [],
     "assign_facets": [],
     "add_explanations": ["WebSearch", "WebFetch"],
+    "seed_topic": ["WebSearch", "WebFetch"],
+    "check_accuracy": [],
+    "fill_card": [],
 }
 
 
@@ -678,6 +774,12 @@ def select_inputs(stage: str, topic_id: str, params: dict) -> list[dict]:
     elif stage == "assign_facets":
         picked = [n for n in nodes if n["kind"] in QUESTION_KINDS and n["status"] != "rejected" and not n["payload"].get("facet")]
         limit = int(params.get("limit") or 40)
+    elif stage == "check_accuracy":
+        picked = [n for n in nodes if needs_check(n)]
+        limit = int(params.get("limit") or 25)
+    elif stage == "fill_card":
+        picked = [n for n in nodes if n["kind"] in QUESTION_KINDS and n["status"] != "rejected" and fill_missing(n)]
+        limit = int(params.get("limit") or 10)
     else:
         picked = []
     return picked[:limit]
@@ -792,6 +894,49 @@ def build_prompt(stage: str, topic_cfg: dict, params: dict, inputs: list[dict]) 
                 "Choose the facet that best describes what the question is about, and copy the facet exactly as written.\n\n"
                 f"CARDS:\n{json.dumps(listing, indent=2, ensure_ascii=False)}\n\n"
                 'Output: {"assignments": [{"id": "<id from above>", "facet": ""}]}' + JSON_TAIL)
+
+    if stage == "seed_topic":
+        count = max(1, min(int(params.get("count") or 10), MAX_FACTS_PER_SOURCE))
+        known = [n["payload"].get("url") for n in S.nodes.values() if n["topic"] == topic_cfg["id"] and n["kind"] == "source" and n["payload"].get("url")]
+        return (head + one_off +
+                f"Task: use web search to find ONE reliable web source with deep factual material about this topic. Open it and read it properly, then extract {count} distinct, verifiable, quiz-worthy facts from that one page. "
+                "For the source give: title, url, summary (1-2 sentences on what it holds), license (e.g. \"CC BY-SA\", \"public domain\", \"unknown\"), and excerpt (at most 40 words, paraphrased). "
+                "Each fact is one self-contained sentence stating the claim precisely (names, numbers, dates), restated in your own words rather than copied. "
+                "Give each a difficulty_hint from the scale below, and an optional context: one sentence (at most 30 words) of surrounding detail that the source itself states. "
+                "Skip anything that changes over time unless it is date-qualified.\n\n"
+                f"{difficulty_guidance()}\n\n{spread_note(topic_cfg, 'facts')}\n\n"
+                f"Sources already collected, do not use these: {json.dumps(known)}\n\n"
+                'Output: {"source": {"title": "", "url": "", "summary": "", "license": "", "excerpt": ""}, "facts": [{"text": "", "context": "", "difficulty_hint": "' + "|".join(TIER_NAMES) + '"}]}' + JSON_TAIL)
+
+    if stage == "check_accuracy":
+        listing = [{"id": n["id"], "card": card_view(n),
+                    "facts": [{"text": f["payload"].get("text", ""), "context": f["payload"].get("context", "")} for f in fact_ancestors(n)]} for n in inputs]
+        return (head + one_off +
+                "Task: check each card below ONLY against the fact(s) it was written from. Do not search the web, and do not use outside knowledge to override the fact; "
+                "if the fact itself looks wrong, say so in notes but still judge the card against it. For each card decide:\n"
+                '- "ok": the question is clear, the answer is supported by the fact (or its context), the explanation (if any) says nothing the fact does not support, '
+                "exactly one choice is defensible, and no wrong choice is also correct.\n"
+                '- "issues": anything else. In notes (one or two plain sentences) say exactly what is wrong.\n'
+                'If a fix is possible using only the fact, give "suggested" containing ONLY the fields that should change (question, answer, choices as the full list of 4 including the answer, explanation); otherwise null. '
+                "Do not suggest changes that are only matters of style or taste.\n\n"
+                f"CARDS:\n{json.dumps(listing, indent=2, ensure_ascii=False)}\n\n"
+                'Output: {"checks": [{"id": "<id from above>", "verdict": "ok|issues", "notes": "", "suggested": null}]}' + JSON_TAIL)
+
+    if stage == "fill_card":
+        listing = []
+        for n in inputs:
+            entry = {"id": n["id"], "card": card_view(n), "missing": fill_missing(n),
+                     "facts": [{"text": f["payload"].get("text", ""), "context": f["payload"].get("context", "")} for f in fact_ancestors(n)]}
+            if n["kind"] == "variant" and n.get("variant_type"):
+                entry["variant_type"], entry["variant_instruction"] = n["variant_type"], VARIANT_TYPES.get(n["variant_type"], "")
+            listing.append(entry)
+        return (head + one_off +
+                'Task: complete the blank parts of each card below, working only from the fact(s) given. Fill ONLY the fields named in "missing" and never change a field that is already present. '
+                'For "choices" return the complete list of 4 distinct strings: every choice already on the card, the correct answer, and plausible wrong answers from the same category. '
+                "Card fields: " + card_fields_spec(topic_cfg) + ".\n\n"
+                f"{difficulty_guidance()}\n\n"
+                f"CARDS:\n{json.dumps(listing, indent=2, ensure_ascii=False)}\n\n"
+                'Output: {"cards": [{"id": "<id from above>", ' + card_key(topic_cfg) + ', "question": "", "answer": "", "choices": ["", "", "", ""], "explanation": ""}]}' + JSON_TAIL)
 
     raise ValueError(f"unknown stage {stage}")
 
@@ -934,6 +1079,97 @@ def apply_result(run: dict, result: dict, inputs: list[dict]) -> None:
             S.save_topic(topic_id)
         run["updated_node_ids"] = updated
 
+    elif stage == "seed_topic":
+        src = result.get("source") or {}
+        url = clean_str(src.get("url"))
+        if not url:
+            raise RuntimeError("the AI did not return a source url")
+        existing = next((n for n in S.nodes.values() if n["topic"] == topic_id and n["kind"] == "source" and n["payload"].get("url") == url), None)
+        if existing:
+            warnings.append("that source was already in this topic; the new facts were attached to it")
+            sid = existing["id"]
+        else:
+            sid = add("source", {"source_type": "web", "title": clean_str(src.get("title")), "url": url, "summary": clean_str(src.get("summary")),
+                                 "license": clean_str(src.get("license")), "excerpt": clean_str(src.get("excerpt"))}, [])["id"]
+        wanted = max(1, min(int(run["params"].get("count") or 10), MAX_FACTS_PER_SOURCE))
+        for item in result.get("facts", [])[:wanted]:
+            text = clean_str(item.get("text"))
+            if text:
+                hint = clean_str(item.get("difficulty_hint")).lower()
+                add("fact", {"text": text, "context": clean_str(item.get("context"))[:EXPLANATION_MAX], "difficulty_hint": hint if hint in DIFFICULTY_SCORES else "intermediate"}, [sid])
+
+    elif stage == "check_accuracy":
+        checked: list[str] = []
+        with S.lock:
+            for item in result.get("checks", []):
+                nid = clean_str(item.get("id"))
+                if nid not in input_ids or nid not in S.nodes:
+                    warnings.append(f"check referenced unknown id {nid!r}; skipped")
+                    continue
+                verdict = clean_str(item.get("verdict")).lower()
+                if verdict not in ("ok", "issues"):
+                    warnings.append(f"{nid}: unclear verdict {verdict!r}; skipped")
+                    continue
+                node = S.nodes[nid]
+                basis = run.get("input_basis", {}).get(nid) or check_basis(node)   # the content that was actually checked
+                notes = clean_str(item.get("notes"))[:600]
+                node["check"] = {"basis": basis, "verdict": verdict, "notes": notes, "at": now_iso(), "run_id": run["id"]}
+                node.pop("suggestion", None)
+                sug = item.get("suggested")
+                if verdict == "issues" and isinstance(sug, dict):
+                    candidate = {**node["payload"], **{k: sug[k] for k in SUGGEST_FIELDS if k in sug}}
+                    clean, problems = normalize_question(candidate, node["payload"].get("input_type"), topic_facets(topic_id))
+                    fields = {k: clean[k] for k in SUGGEST_FIELDS if clean[k] != node["payload"].get(k)}
+                    if problems:
+                        warnings.append(f"{nid}: the suggested fix was unusable ({'; '.join(problems)}); showing the notes only")
+                    elif fields:
+                        node["suggestion"] = {"fields": fields, "notes": notes, "at": now_iso(), "run_id": run["id"], "basis": basis}
+                node["history"].append({"at": now_iso(), "by": "agent", "action": "check", "verdict": verdict, "run_id": run["id"]})
+                node["history"] = node["history"][-60:]
+                checked.append(nid)
+            S.save_topic(topic_id)
+        run["updated_node_ids"] = checked
+
+    elif stage == "fill_card":
+        filled: list[str] = []
+        with S.lock:
+            for item in result.get("cards", []):
+                nid = clean_str(item.get("id"))
+                if nid not in input_ids or nid not in S.nodes:
+                    warnings.append(f"card referenced unknown id {nid!r}; skipped")
+                    continue
+                node = S.nodes[nid]
+                missing = fill_missing(node)
+                if not missing:
+                    continue
+                before = json.loads(json.dumps(node["payload"]))
+                new = dict(node["payload"])
+                for key in missing:
+                    if key == "choices":
+                        have = [clean_str(c) for c in (new.get("choices") or []) if clean_str(c)]
+                        for c in [clean_str(c) for c in (item.get("choices") or [])] + [clean_str(new.get("answer") or item.get("answer"))]:
+                            if c and c.lower() not in [h.lower() for h in have] and len(have) < 4:
+                                have.append(c)
+                        new["choices"] = have
+                    elif key in ("facet", "title"):
+                        new[key] = clean_str(item.get(key))
+                    else:
+                        new[key] = clean_str(item.get(key))
+                        if key == "explanation" and new[key]:
+                            facts = fact_ancestors(node)
+                            new["explanation_source"], new["explanation_verified"] = (source_ref(facts[0]) if facts else ""), False
+                clean, problems = normalize_question(new, node["payload"].get("input_type"), topic_facets(topic_id))
+                if problems:
+                    warnings.append(f"{nid}: " + "; ".join(problems) + " (filled what could be filled - finish it by hand)")
+                node["payload"] = clean
+                node["history"].append({"at": now_iso(), "by": "agent", "action": "fill", "run_id": run["id"], "before": before})
+                node["history"] = node["history"][-60:]
+                node["updated_at"] = now_iso()
+                node.pop("suggestion", None)
+                filled.append(nid)
+            S.save_topic(topic_id)
+        run["updated_node_ids"] = filled
+
     run["created_node_ids"] = created
 
 
@@ -975,6 +1211,22 @@ def mock_response(run: dict, inputs: list[dict], topic_cfg: dict) -> dict:
                              "answer": p.get("answer"), "choices": list(p.get("choices") or []), "difficulty": p.get("difficulty"), "explanation": p.get("explanation", "")}}
     if stage == "add_explanations":
         return {"explanations": [{"id": n["id"], "explanation": f"MOCK explanation for: {n['payload'].get('question', '')[:50]}", "source_url": "https://example.com/mock-explanation", "note": ""} for n in inputs]}
+    if stage == "seed_topic":
+        k = int(run["params"].get("count") or 10)
+        return {"source": {"title": f"MOCK source about {name}", "url": f"https://example.com/mock/{topic_cfg['id']}/seed{n}", "summary": "Placeholder.", "license": "n/a", "excerpt": "Mock excerpt."},
+                "facts": [{"text": f"MOCK fact {j + 1} about {name}.", "context": f"MOCK context {j + 1}.", "difficulty_hint": TIER_NAMES[j % len(TIER_NAMES)]} for j in range(k)]}
+    if stage == "check_accuracy":
+        out = []
+        for q in inputs:
+            p = q["payload"]
+            if "MOCKBAD" in (p.get("question") or ""):
+                out.append({"id": q["id"], "verdict": "issues", "notes": "MOCK: the question contains a flagged word.", "suggested": {"question": p["question"].replace("MOCKBAD", "MOCKFIXED")}})
+            else:
+                out.append({"id": q["id"], "verdict": "ok", "notes": "", "suggested": None})
+        return {"checks": out}
+    if stage == "fill_card":
+        return {"cards": [{"id": q["id"], **face(i, q["payload"]), "question": q["payload"].get("question") or "MOCK filled question", "answer": q["payload"].get("answer") or "Mock answer",
+                           "choices": [q["payload"].get("answer") or "Mock answer", "Mock wrong A", "Mock wrong B", "Mock wrong C"], "explanation": "MOCK filled explanation"} for i, q in enumerate(inputs)]}
     if stage == "suggest_facets":
         return {"facets": ["Mock One", "Mock Two", "Mock Three", "Mock Four"]}
     if stage == "assign_facets":
@@ -1004,6 +1256,7 @@ class Runner:
                 "status": "queued", "backend": "opentdb" if stage == "opentdb" else cfg["backend"], "model": cfg.get("model", ""),
                 "prompt": prompt, "tools": STAGE_TOOLS.get(stage, []), "instructions": instruction_block(topic_cfg, stage),
                 "input_ids": [n["id"] for n in inputs], "created_at": now_iso(), "started_at": None, "ended_at": None,
+                "input_basis": {n["id"]: check_basis(n) for n in inputs if n["kind"] in QUESTION_KINDS},
                 "cost_usd": None, "raw_output": "", "error": "", "warnings": [], "created_node_ids": [],
             }
             STORE.runs[run["id"]] = run
@@ -1161,6 +1414,8 @@ def export_topic(topic_id: str, write: bool) -> dict:
     cfg = S.topic_cfg(topic_id)
     if not cfg or cfg.get("stage", "active") != "active":
         raise ApiError(400, "only active topics can be exported - promote the idea first")
+    if not cfg.get("approved"):
+        raise ApiError(400, "approve the topic first (it needs at least one approved question)")
     supported = S.config["game_input_types"]
     cards, skipped = [], []
     require_verified = S.config.get("require_verified_explanations", True)
@@ -1332,6 +1587,14 @@ def api_node(node_id: str) -> dict:
         "run": run_summary(run) if run else None,
         "facts_waiting": 0 if node["kind"] in QUESTION_KINDS or node["kind"] == "fact" else len(facts_waiting(node["topic"], node_id)),
         "problems": normalize_question(node["payload"], node["payload"].get("input_type"), topic_facets(node["topic"]))[1] if node["kind"] in QUESTION_KINDS else [],
+        "check": {
+            "state": check_state(node) if node["kind"] in QUESTION_KINDS else None,
+            "record": node.get("check"),
+            "suggestion": node.get("suggestion"),
+            "has_fact": bool(fact_ancestors(node)) if node["kind"] in QUESTION_KINDS else None,
+            "missing": fill_missing(node) if node["kind"] in QUESTION_KINDS else None,
+            "rollup": check_rollup(S.descendants_of(node_id)) if node["kind"] not in QUESTION_KINDS else None,
+        },
     }
 
 
@@ -1362,6 +1625,7 @@ def api_update_node(node_id: str, body: dict) -> dict:
                     new_payload["explanation_mock"] = False
             if new_payload != before:
                 node["payload"] = new_payload
+                node.pop("suggestion", None)   # it was written for the old text
                 node["history"].append({"at": now_iso(), "by": by, "action": "edit", "before": before})
         if "status" in body:
             status = body["status"]
@@ -1431,17 +1695,115 @@ def api_create_node(body: dict) -> dict:
     return api_node(node["id"])
 
 
-def api_delete_node(node_id: str) -> dict:
+def delete_plan(node_id: str) -> tuple[set[str], list[str]]:
+    """Everything that goes with a node: its descendants that hang only from deleted nodes. Anything that also
+    descends from a surviving node is kept and just loses this parent."""
     S = STORE
+    doomed = {node_id}
+    changed = True
+    while changed:
+        changed = False
+        for c in S.nodes.values():
+            if c["id"] not in doomed and c["parent_ids"] and any(p in doomed for p in c["parent_ids"]) \
+                    and all(p in doomed or p not in S.nodes for p in c["parent_ids"]):
+                doomed.add(c["id"])
+                changed = True
+    detached = [c["id"] for c in S.nodes.values() if c["id"] not in doomed and any(p in doomed for p in c["parent_ids"])]
+    return doomed, detached
+
+
+def api_delete_node(node_id: str, body: dict | None = None) -> dict:
+    """Permanent delete - no archive, no record. Children go too only with cascade; body {"preview": true} just counts."""
+    S, body = STORE, body or {}
     with S.lock:
         node = S.nodes.get(node_id)
         if not node:
             raise ApiError(404, "unknown node")
-        if S.children_of(node_id):
-            raise ApiError(400, "this node has derived children; reject it instead, or delete those first")
-        del S.nodes[node_id]
+        doomed, detached = delete_plan(node_id)
+        kids = doomed - {node_id}
+        by_kind: dict[str, int] = {}
+        for i in kids:
+            by_kind[S.nodes[i]["kind"]] = by_kind.get(S.nodes[i]["kind"], 0) + 1
+        info = {"children": len(kids), "by_kind": by_kind, "detached": len(detached)}
+        if body.get("preview"):
+            return {"preview": True, **info}
+        if kids and not body.get("cascade"):
+            raise ApiError(400, f"this node has {len(kids)} derived item(s) that would be deleted with it", info)
+        for i in doomed:
+            del S.nodes[i]
+        for i in detached:
+            S.nodes[i]["parent_ids"] = [p for p in S.nodes[i]["parent_ids"] if p in S.nodes]
         S.save_topic(node["topic"])
-    return {"deleted": node_id}
+    return {"deleted": sorted(doomed), **info}
+
+
+def api_suggestion(node_id: str, body: dict) -> dict:
+    """Act on an accuracy-check suggestion: accept (apply it), dismiss (drop it), keep (drop it and mark the card fine as written), undo (reverse an accept)."""
+    S = STORE
+    action = clean_str(body.get("action"))
+    with S.lock:
+        node = S.nodes.get(node_id)
+        if not node or node["kind"] not in QUESTION_KINDS:
+            raise ApiError(404, "unknown card")
+        stamp = now_iso()
+        if action == "undo":
+            last = node["history"][-1] if node["history"] else {}
+            if last.get("action") != "accept_suggestion":
+                raise ApiError(400, "nothing to undo - the last change wasn't an accepted suggestion")
+            node["payload"] = last["before"]
+            if last.get("prev_check"):
+                node["check"] = last["prev_check"]
+            else:
+                node.pop("check", None)
+            if last.get("prev_suggestion"):
+                node["suggestion"] = last["prev_suggestion"]
+            node["history"].pop()
+        else:
+            sug = node.get("suggestion")
+            if action not in ("accept", "dismiss", "keep"):
+                raise ApiError(400, "action must be accept, dismiss, keep or undo")
+            if not sug:
+                raise ApiError(400, "this card has no pending suggestion")
+            if action == "accept":
+                if sug.get("basis") != check_basis(node):
+                    raise ApiError(409, "the card changed after this suggestion was made - run the check again")
+                before = json.loads(json.dumps(node["payload"]))
+                new_payload, _ = normalize_question({**node["payload"], **sug["fields"]}, node["payload"].get("input_type"), topic_facets(node["topic"]))
+                if new_payload.get("explanation") != before.get("explanation"):
+                    new_payload["explanation_verified"], new_payload["explanation_mock"] = False, False
+                node["history"].append({"at": stamp, "by": "human (accepted suggestion)", "action": "accept_suggestion", "before": before,
+                                        "prev_check": node.get("check"), "prev_suggestion": sug})
+                node["payload"] = new_payload
+                node["check"] = {"basis": check_basis(node), "verdict": "ok", "notes": "applied the suggested fix", "at": stamp, "run_id": sug.get("run_id")}
+                node.pop("suggestion", None)
+            elif action == "keep":
+                node["check"] = {"basis": check_basis(node), "verdict": "ok", "notes": "kept as written", "at": stamp, "run_id": (node.get("check") or {}).get("run_id")}
+                node.pop("suggestion", None)
+                node["history"].append({"at": stamp, "by": "human", "action": "keep_as_written"})
+            else:
+                node.pop("suggestion", None)
+                node["history"].append({"at": stamp, "by": "human", "action": "dismiss_suggestion"})
+        node["history"] = node["history"][-60:]
+        node["updated_at"] = stamp
+        S.save_topic(node["topic"])
+    return api_node(node_id)
+
+
+def api_search(body: dict) -> dict:
+    S = STORE
+    q = clean_str(body.get("q")).lower()
+    if len(q) < 2:
+        return {"topics": [], "nodes": []}
+    topics = [{"id": t["id"], "name": t["name"], "department": t["department"], "stage": t.get("stage", "active"), "approved": bool(t.get("approved"))}
+              for t in S.config["topics"] if q in " ".join([t["name"], t["department"], t["id"], t.get("note", "")]).lower()]
+    names = {t["id"]: t["name"] for t in S.config["topics"]}
+    hits = []
+    for n in sorted(S.nodes.values(), key=lambda n: (n["topic"], n["created_at"])):
+        p = n["payload"]
+        hay = " ".join(str(x) for k in ("question", "answer", "title", "facet", "text", "context", "summary", "explanation", "url") for x in [p.get(k, "")]) + " " + " ".join(p.get("choices") or [])
+        if q in hay.lower():
+            hits.append({"id": n["id"], "topic": n["topic"], "topic_name": names.get(n["topic"], n["topic"]), "kind": n["kind"], "status": n["status"], "snippet": S.snippet(n)})
+    return {"topics": topics, "nodes": hits[:60], "total_nodes": len(hits)}
 
 
 def api_run(body: dict) -> dict:
@@ -1474,13 +1836,25 @@ def api_run(body: dict) -> dict:
             raise ApiError(400, "this topic already has facets - edit them on the topic page")
         if stage == "assign_facets" and not topic_cfg.get("facets"):
             raise ApiError(400, "give the topic facets first (type them in, or use Suggest facets)")
+        if stage == "check_accuracy":
+            for nid in params.get("input_ids") or []:
+                nd = S.nodes.get(nid)
+                if not nd or nd["kind"] not in QUESTION_KINDS or not fact_ancestors(nd):
+                    raise ApiError(400, "check_accuracy needs cards that were written from a fact")
         inputs = select_inputs(stage, topic_id, params)
-        if stage in ("extract_facts", "draft_questions", "make_variants", "revise", "assign_facets", "add_explanations") and not inputs:
+        if stage in ("extract_facts", "draft_questions", "make_variants", "revise", "assign_facets", "add_explanations", "check_accuracy", "fill_card") and not inputs:
             raise ApiError(400, {"extract_facts": "no sources are waiting for fact extraction", "draft_questions": "no facts are waiting for questions",
                                  "make_variants": "no approved questions are waiting for that variant type", "revise": "nothing to revise",
                                  "assign_facets": "every card in this topic already has a facet",
-                                 "add_explanations": "every card in this topic already has an explanation"}[stage])
+                                 "add_explanations": "every card in this topic already has an explanation",
+                                 "check_accuracy": "nothing needs checking - every card with a fact is checked and unchanged",
+                                 "fill_card": "no card has blanks to fill"}[stage])
         prompt = build_prompt(stage, topic_cfg, params, inputs)
+        override = clean_str(body.get("prompt"))
+        if override:   # the author edited the generated prompt before running it
+            if "Output:" not in override:
+                raise ApiError(400, "keep the 'Output:' line at the end of the prompt - the studio needs it to read the answer")
+            prompt = override
     followup = ""
     if stage == "draft_questions" and not params.get("input_ids"):
         rest = len(facts_waiting(topic_id, clean_str(params.get("under")))) - len(inputs)
@@ -1493,6 +1867,68 @@ def api_run(body: dict) -> dict:
     run = RUNNER.make_run(stage, topic_cfg, params, inputs, prompt)
     RUNNER.submit(run)
     return run_summary(run)
+
+
+def _scope(body: dict) -> tuple[dict, dict | None]:
+    S = STORE
+    t = S.topic_cfg(body.get("topic") or "")
+    if not t:
+        raise ApiError(400, "need a valid topic")
+    node_id = clean_str(body.get("node_id"))
+    node = S.nodes.get(node_id) if node_id else None
+    if node_id and (not node or node["topic"] != t["id"]):
+        raise ApiError(404, "unknown node")
+    return t, node
+
+
+def api_fill(body: dict) -> dict:
+    """'Fill in automatically' at any level: it works out the next stage that applies, and only ever fills what is blank."""
+    S = STORE
+    t, node = _scope(body)
+    params: dict = {"note": clean_str(body.get("note"))}
+    if node:
+        if node["kind"] in QUESTION_KINDS:
+            if not fill_missing(node):
+                raise ApiError(400, "nothing is blank on this card")
+            stage, params["input_ids"] = "fill_card", [node["id"]]
+        elif node["kind"] == "fact":
+            if any(c["kind"] == "question" for c in S.children_of(node["id"])):
+                raise ApiError(400, "this fact already has a question - open it to fill any blanks")
+            stage, params["input_ids"], params["difficulty"] = "draft_questions", [node["id"]], clean_str(body.get("difficulty"))
+        else:
+            stage, params["input_ids"], params["per_item"] = "extract_facts", [node["id"]], int(body.get("count") or 10)
+    else:
+        mine = [n for n in S.nodes.values() if n["topic"] == t["id"]]
+        sources = [n for n in mine if n["kind"] == "source" and n["status"] != "rejected"]
+        if not sources:
+            stage, params["count"] = "seed_topic", int(body.get("count") or 10)
+        elif any("fact" not in {c["kind"] for c in S.children_of(n["id"])} for n in sources):
+            stage, params["limit"], params["per_item"] = "extract_facts", 5, int(body.get("count") or 10)
+        elif facts_waiting(t["id"]):
+            stage, params["limit"] = "draft_questions", 10
+        elif any(n["kind"] in QUESTION_KINDS and n["status"] != "rejected" and fill_missing(n) for n in mine):
+            stage = "fill_card"
+        else:
+            raise ApiError(400, "nothing left to fill in automatically")
+    return api_run({"stage": stage, "topic": t["id"], "params": params, "preview": body.get("preview"), "prompt": body.get("prompt")})
+
+
+def api_check(body: dict) -> dict:
+    """'Check for accuracy' at any level: checks the cards beneath it that are new or changed since their last check."""
+    S = STORE
+    t, node = _scope(body)
+    if node and node["kind"] in QUESTION_KINDS:
+        if not fact_ancestors(node):
+            raise ApiError(400, "this card has no fact to check against")
+        todo = [node]
+    else:
+        pool = S.descendants_of(node["id"]) if node else [n for n in S.nodes.values() if n["topic"] == t["id"]]
+        todo = [n for n in sorted(pool, key=lambda n: n["created_at"]) if needs_check(n)]
+        if not todo:
+            raise ApiError(400, "nothing to check - every card here is checked and unchanged" if any(n["kind"] in QUESTION_KINDS and fact_ancestors(n) for n in pool)
+                           else "there are no cards with a fact to check against")
+    ids = [n["id"] for n in todo][:25]
+    return api_run({"stage": "check_accuracy", "topic": t["id"], "params": {"input_ids": ids, "note": clean_str(body.get("note"))}, "preview": body.get("preview"), "prompt": body.get("prompt")})
 
 
 def api_create_topic(body: dict) -> dict:
@@ -1539,6 +1975,15 @@ def api_update_topic(topic_id: str, body: dict) -> dict:
             t["note"] = clean_str(body["note"])
         if "facets" in body:
             t["facets"] = clean_facets(body["facets"])
+        if "approved" in body:
+            want = bool(body["approved"])
+            if want and current == "archived":
+                raise ApiError(400, "an archived topic can't be approved")
+            if want and not any(n["topic"] == topic_id and n["kind"] in QUESTION_KINDS and n["status"] == "approved" for n in S.nodes.values()):
+                raise ApiError(400, "approve at least one question in this topic first")
+            t["approved"] = want
+            if want and current == "idea":   # an approved topic is in the game, so it is active
+                t["stage"] = current = "active"
         if "stage" in body and body["stage"] != current:
             new = body["stage"]
             allowed = {"idea": ("active", "archived"), "archived": ("idea",), "active": ()}
@@ -1643,13 +2088,17 @@ route("PUT", r"/api/config")(lambda m, b: api_put_config(b))
 route("GET", r"/api/topics/([\w-]+)/nodes")(lambda m, b: api_topic_nodes(m.group(1)))
 route("GET", r"/api/nodes/([\w-]+)")(lambda m, b: api_node(m.group(1)))
 route("PUT", r"/api/nodes/([\w-]+)")(lambda m, b: api_update_node(m.group(1), b))
-route("DELETE", r"/api/nodes/([\w-]+)")(lambda m, b: api_delete_node(m.group(1)))
+route("DELETE", r"/api/nodes/([\w-]+)")(lambda m, b: api_delete_node(m.group(1), b))
+route("POST", r"/api/nodes/([\w-]+)/suggestion")(lambda m, b: api_suggestion(m.group(1), b))
+route("GET", r"/api/search")(lambda m, b: api_search(b))
+route("POST", r"/api/fill")(lambda m, b: api_fill(b))
+route("POST", r"/api/check")(lambda m, b: api_check(b))
 route("POST", r"/api/nodes")(lambda m, b: api_create_node(b))
 route("POST", r"/api/run")(lambda m, b: api_run(b))
 route("GET", r"/api/runs")(lambda m, b: {"runs": [run_summary(r) for r in sorted(STORE.runs.values(), key=lambda r: r["created_at"], reverse=True)]})
 route("GET", r"/api/runs/([\w-]+)")(lambda m, b: run_summary(STORE.runs[m.group(1)], full=True) if m.group(1) in STORE.runs else (_ for _ in ()).throw(ApiError(404, "unknown run")))
 route("POST", r"/api/runs/([\w-]+)/cancel")(lambda m, b: (RUNNER.cancel(m.group(1)), {"ok": True})[1])
-route("POST", r"/api/export")(lambda m, b: {"results": [export_topic(t, bool(b.get("write"))) for t in ([b["topic"]] if b.get("topic") else [x["id"] for x in STORE.topics_in_stage("active")])]})
+route("POST", r"/api/export")(lambda m, b: {"results": [export_topic(t, bool(b.get("write"))) for t in ([b["topic"]] if b.get("topic") else [x["id"] for x in STORE.topics_in_stage("active") if x.get("approved")])]})
 route("POST", r"/api/topics")(lambda m, b: api_create_topic(b))
 route("PUT", r"/api/topics/([\w-]+)")(lambda m, b: api_update_topic(m.group(1), b))
 route("DELETE", r"/api/topics/([\w-]+)")(lambda m, b: api_delete_topic(m.group(1)))
@@ -1739,7 +2188,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, file.read_bytes(), MIME[file.suffix]) if file.exists() else self._json(404, {"error": "ui file missing"})
         if not path.startswith("/api/"):
             return self._json(404, {"error": "not found"})
-        body: dict = {}
+        body: dict = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()} if method == "GET" else {}
         if method in ("POST", "PUT", "DELETE"):
             if "application/json" not in (self.headers.get("Content-Type") or ""):
                 return self._json(415, {"error": "JSON only"})  # forces a CORS preflight for foreign pages
