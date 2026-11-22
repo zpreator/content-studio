@@ -157,3 +157,22 @@ button.big { min-height: 48px; min-width: 132px; font-size: 16px; font-weight: 6
   button.big { min-width: 96px; padding: 6px 10px; }
   .cardnav.bottom { position: sticky; bottom: 0; z-index: 5; margin: 12px -12px -12px; border-radius: 0; border-left: none; border-right: none; box-shadow: 0 -6px 14px rgba(0,0,0,.35); }
 }
+
+/* step 4: review */
+.review { max-width: 780px; margin: 0 auto; }
+.rcard { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 22px; }
+.rmeta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.rlabel { margin-top: 14px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.rq { font-size: 21px; line-height: 1.4; margin: 8px 0 18px; font-weight: 600; }
+.rchoices { margin-top: 24px; }
+.rchoice { padding: 11px 14px; border: 1px solid var(--border); border-radius: 8px; margin: 7px 0; background: var(--panel2); }
+.rchoice.correct { border-color: var(--green); background: #15251a; } .rchoice .tick { color: var(--green); font-weight: 700; }
+.rexp { margin-top: 12px; font-size: 13px; }
+.rwarn { margin-top: 12px; padding: 10px; border: 1px solid var(--amber); border-radius: 6px; background: #1d1a12; color: var(--amber); }
+.ractions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 18px; }
+.ractions .big:first-child { margin-right: auto; } .ractions .big:last-child { margin-left: auto; }
+.rdone { text-align: center; padding: 40px 22px; }
+.swipehint { display: none; margin-top: 10px; text-align: center; font-size: 12px; color: var(--muted); }
+.chip.ck-ok { border-color: var(--green); color: var(--green); } .chip.ck-issues { border-color: var(--red); color: var(--red); } .chip.ck-stale { border-color: var(--amber); color: var(--amber); }
+@media (hover: none) { .swipehint { display: block; } }
+@media (max-width: 760px) { .rq { font-size: 19px; } .ractions { position: sticky; bottom: 0; background: var(--panel); padding: 10px 0 2px; margin-top: 14px; } .ractions .big { flex: 1 1 40%; } .ractions .big:first-child, .ractions .big:last-child { margin: 0; } }
