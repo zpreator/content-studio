@@ -9,9 +9,8 @@ Everything is a *node* in a lineage graph, stored as plain JSON under
 design/content/ (diff-friendly, lives in git):
 
     source  -> fact -> question -> variant (paraphrase / harder / easier /
-    (web page,   (one    (a game     true_false / revision ...)
-     OpenTDB     claim)   card)
-     record)
+    (web page,   (one    (a game     true_false ...)
+     record)     claim)   card)
 
 Each node records where it came from (which AI run, with what instructions,
 which parent nodes), and every parent is one click away in the UI. Agent
@@ -29,7 +28,6 @@ import argparse
 import hashlib
 import ipaddress
 import socket
-import html
 import json
 import os
 import random
@@ -40,11 +38,9 @@ import tempfile
 import threading
 import time
 import urllib.parse
-import urllib.request
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -72,9 +68,6 @@ MAX_FACTS_PER_SOURCE = 40   # per run, so one response stays a sensible size; ru
 EXPLANATION_SPEC = ('"explanation" (optional "did you know" line: one or two sentences, at most 30 words, each adding something new (no filler), telling the player more about the answer, '
                     'using ONLY information already in the fact, its context or the card shown - never add outside claims; "" if there is nothing to add)')
 DEPARTMENTS = ["Geography", "Entertainment", "History", "Arts & Literature", "Science & Nature", "Sports & Leisure"]
-# What "worth promoting" means for an idea: enough distinct facts, from more than one independent site.
-VET_MIN_FACTS = 30
-VET_MIN_DOMAINS = 2
 KINDS = ("source", "fact", "question", "variant")
 STATUSES = ("draft", "approved", "rejected")
 QUESTION_KINDS = ("question", "variant")
@@ -120,25 +113,8 @@ DEFAULT_INSTRUCTIONS = {
         "extract_facts": "Favour facts that are stable over time and have one clear correct answer.",
         "draft_questions": "Each question must have exactly one defensible correct answer.",
         "make_variants": "",
-        "revise": "",
     },
 }
-
-OPENTDB_HINTS = {
-    "world_capitals": ([22], ["capital", "country", "countries"]),
-    "us_geography": ([22], ["united states", "america", "texas", "california", "new york", "state"]),
-    "ww2": ([23], ["world war ii", "world war 2", "hitler", "nazi", "pearl harbor", "normandy", "allied", "d-day"]),
-    "cold_war": ([23], ["cold war", "soviet", "stalin", "berlin wall", "vietnam", "mao", "khrushchev", "gorbachev"]),
-    "solar_system": ([17], ["planet", "solar system", "sun", "moon", "star", "galaxy", "orbit"]),
-    "human_biology": ([17], ["bone", "organ", "muscle", "heart", "brain", "dna", "cell", "blood", "lung"]),
-    "famous_painters": ([25], []),
-    "harry_potter": ([10], ["harry potter", "hogwarts", "rowling", "horcrux"]),
-    "soccer": ([21], ["fifa", "world cup", "football", "soccer", "uefa", "premier league", "manchester united", "real madrid", "ronaldo", "messi"]),
-    "formula_one": ([21, 28], ["formula", "grand prix", "f1", "schumacher", "hamilton", "senna", "le mans"]),
-    "star_wars": ([11, 14], ["star wars", "jedi", "sith", "darth", "skywalker"]),
-    "doctor_who": ([14], ["doctor who", "tardis", "dalek", "gallifrey"]),
-}
-
 
 # --------------------------------------------------------------------------
 # helpers
@@ -295,6 +271,10 @@ class Store:
         self.config = self._load_or_seed_config()
         self._load_all()
         self._migrate_topic_approval()
+        notes = self.config.get("instructions", {}).get("stages", {})
+        if "revise" in notes:   # the "revise with note" stage was removed
+            del notes["revise"]
+            self.save_config()
 
     # -- config ------------------------------------------------------------
     def _load_or_seed_config(self) -> dict:
@@ -347,10 +327,9 @@ class Store:
             if not path.exists():
                 continue
             doc = json.loads(path.read_text(encoding="utf-8"))
-            cats, words = OPENTDB_HINTS.get(folder, ([], []))
             topics.append({
                 "id": folder, "name": doc.get("topic", folder), "department": doc.get("department", ""),
-                "folder": folder, "target": 24, "opentdb": {"categories": cats, "keywords": words},
+                "folder": folder, "target": 24,
             })
         return topics
 
@@ -381,31 +360,6 @@ class Store:
 
     def topics_in_stage(self, stage: str) -> list[dict]:
         return [t for t in self.config["topics"] if t.get("stage", "active") == stage]
-
-    def vet_summary(self, topic_id: str) -> dict:
-        nodes = [n for n in self.nodes.values() if n["topic"] == topic_id]
-        sources = [n for n in nodes if n["kind"] == "source" and n["status"] != "rejected"]
-        facts = [n for n in nodes if n["kind"] == "fact" and n["status"] != "rejected"]
-        domains = set()
-        for n in sources:
-            if n["payload"].get("source_type") == "web" and n["payload"].get("url"):
-                host = urllib.parse.urlparse(n["payload"]["url"]).netloc.lower()
-                domains.add(host[4:] if host.startswith("www.") else host)
-        runs = [r for r in self.runs.values() if r["topic"] == topic_id and r["stage"] in ("find_sources", "extract_facts")]
-        running = any(r["status"] in ("queued", "running") for r in runs)
-        if running:
-            verdict = "vetting"
-        elif not runs and not sources and not facts:
-            verdict = "unvetted"
-        elif len(facts) >= VET_MIN_FACTS and len(domains) >= VET_MIN_DOMAINS:
-            verdict = "strong"
-        elif len(facts) >= VET_MIN_FACTS // 2:
-            verdict = "maybe"
-        else:
-            verdict = "thin"
-        return {"verdict": verdict, "sources": len(sources), "domains": len(domains), "facts": len(facts),
-                "mock": any(n["provenance"].get("mock") for n in sources + facts),
-                "min_facts": VET_MIN_FACTS, "min_domains": VET_MIN_DOMAINS}
 
     # -- loading / saving -------------------------------------------------
     def _load_all(self) -> None:
@@ -555,8 +509,6 @@ class Store:
         out["facet_counts"] = {f: sum(1 for n in card_nodes if n["payload"].get("facet") == f) for f in facets}
         out["facet_unassigned"] = sum(1 for n in card_nodes if not n["payload"].get("facet")) if facets else 0
         out["facet_orphans"] = sum(1 for n in card_nodes if n["payload"].get("facet") and n["payload"]["facet"] not in facets) if facets else 0
-        if out["stage"] != "active":
-            out["vet"] = self.vet_summary(tid)
         return out
 
 
@@ -638,12 +590,10 @@ def fill_missing(node: dict) -> list[str]:
 JSON_TAIL = "\n\nRespond with ONLY the JSON object described above: no markdown fences, no commentary."
 
 STAGE_LABELS = {
-    "opentdb": "Import from OpenTDB",
     "find_sources": "Find sources",
     "extract_facts": "Extract facts",
     "draft_questions": "Draft questions",
     "make_variants": "Make variants",
-    "revise": "Revise with note",
     "suggest_facets": "Suggest facets",
     "assign_facets": "Assign facets to cards",
     "add_explanations": "Add explanations",
@@ -656,7 +606,6 @@ STAGE_TOOLS = {
     "extract_facts": ["WebFetch"],
     "draft_questions": [],
     "make_variants": [],
-    "revise": [],
     "suggest_facets": [],
     "assign_facets": [],
     "add_explanations": ["WebSearch", "WebFetch"],
@@ -864,16 +813,6 @@ def build_prompt(stage: str, topic_cfg: dict, params: dict, inputs: list[dict]) 
                 f"QUESTIONS:\n{json.dumps(listing, indent=2, ensure_ascii=False)}\n\n"
                 'Output: {"variants": [{"question_id": "<id from above>", ' + card_key(topic_cfg) + ', "question": "", "answer": "", "choices": ["", "", "", ""], "difficulty": "", "explanation": ""}]}' + JSON_TAIL)
 
-    if stage == "revise":
-        n = inputs[0]
-        current = card_view(n)
-        return (head + one_off +
-                "Task: revise the question below according to the reviewer's note in the extra instruction. Keep it factually accurate and keep the same underlying fact "
-                "unless the note says otherwise. Fields: " + card_fields_spec(topic_cfg) + ".\n\n"
-                f"{difficulty_guidance()}\n\n"
-                f"CURRENT QUESTION:\n{json.dumps(current, indent=2, ensure_ascii=False)}\n\n"
-                'Output: {"question": {' + card_key(topic_cfg) + ', "question": "", "answer": "", "choices": ["", "", "", ""], "difficulty": "", "explanation": ""}}' + JSON_TAIL)
-
     if stage == "add_explanations":
         listing = [{"id": n["id"], "question": n["payload"].get("question"), "answer": n["payload"].get("answer")} for n in inputs]
         return (head + one_off +
@@ -992,19 +931,17 @@ def apply_result(run: dict, result: dict, inputs: list[dict]) -> None:
             hint = clean_str(item.get("difficulty_hint")).lower()
             add("fact", {"text": text, "context": clean_str(item.get("context"))[:EXPLANATION_MAX], "difficulty_hint": hint if hint in DIFFICULTY_SCORES else "intermediate"}, [sid])
 
-    elif stage in ("draft_questions", "make_variants", "revise"):
+    elif stage in ("draft_questions", "make_variants"):
         if stage == "draft_questions":
             items, ref_key, kind = result.get("questions", []), "fact_id", "question"
-        elif stage == "make_variants":
-            items, ref_key, kind = result.get("variants", []), "question_id", "variant"
         else:
-            items, ref_key, kind = [dict(result.get("question") or {}, **{"__ref": inputs[0]["id"]})], "__ref", "variant"
+            items, ref_key, kind = result.get("variants", []), "question_id", "variant"
         for item in items:
             ref = clean_str(item.get(ref_key))
             if ref not in input_ids:
                 warnings.append(f"item referenced unknown id {ref!r}; skipped")
                 continue
-            vtype = run["params"].get("variant_type", "paraphrase") if stage == "make_variants" else ("revision" if stage == "revise" else None)
+            vtype = run["params"].get("variant_type", "paraphrase") if stage == "make_variants" else None
             itype = "true_false" if vtype == "true_false" else "multiple_choice"
             clean, problems = normalize_question(item, itype, topic_facets(topic_id))
             asked = wanted_tier(run["params"]) if stage == "draft_questions" else ""
@@ -1021,8 +958,6 @@ def apply_result(run: dict, result: dict, inputs: list[dict]) -> None:
                     clean["explanation_verified"] = bool(parent_payload.get("explanation_verified")) and clean["explanation"] == parent_payload.get("explanation")
             if problems:
                 warnings.append(f"{clean.get('title') or clean.get('question')[:40] or ref}: " + "; ".join(problems) + " (kept as draft - fix before approving)")
-            if stage == "revise":
-                clean["card_id"] = ""  # a revision is its own card; the original keeps its id
             add(kind, clean, [ref], vtype)
 
     elif stage == "add_explanations":
@@ -1213,10 +1148,6 @@ def mock_response(run: dict, inputs: list[dict], topic_cfg: dict) -> dict:
                 out.append({"question_id": q["id"], **face(0, p, " II"), "question": f"MOCK {vt}: {p.get('question')}", "answer": p.get("answer"),
                             "choices": list(p.get("choices") or []), "difficulty": p.get("difficulty"), "explanation": p.get("explanation", "")})
         return {"variants": out}
-    if stage == "revise":
-        p = inputs[0]["payload"]
-        return {"question": {**face(0, p), "question": f"MOCK revised ({clean_str(run['params'].get('note'))[:40]}): {p.get('question')}",
-                             "answer": p.get("answer"), "choices": list(p.get("choices") or []), "difficulty": p.get("difficulty"), "explanation": p.get("explanation", "")}}
     if stage == "add_explanations":
         return {"explanations": [{"id": n["id"], "explanation": f"MOCK explanation for: {n['payload'].get('question', '')[:50]}", "source_url": "https://example.com/mock-explanation", "note": ""} for n in inputs]}
     if stage == "seed_topic":
@@ -1261,7 +1192,7 @@ class Runner:
         with STORE.lock:
             run = {
                 "id": STORE.new_id("run", STORE.runs), "stage": stage, "topic": topic_cfg["id"], "params": params,
-                "status": "queued", "backend": "opentdb" if stage == "opentdb" else cfg["backend"], "model": cfg.get("model", ""),
+                "status": "queued", "backend": cfg["backend"], "model": cfg.get("model", ""),
                 "prompt": prompt, "tools": STAGE_TOOLS.get(stage, []), "instructions": instruction_block(topic_cfg, stage),
                 "input_ids": [n["id"] for n in inputs], "created_at": now_iso(), "started_at": None, "ended_at": None,
                 "input_basis": {n["id"]: check_basis(n) for n in inputs if n["kind"] in QUESTION_KINDS},
@@ -1298,17 +1229,14 @@ class Runner:
             t0 = time.time()
             try:
                 topic_cfg = STORE.topic_cfg(run["topic"])
-                if run["stage"] == "opentdb":
-                    self._run_opentdb(run, topic_cfg)
+                inputs = [STORE.nodes[i] for i in run["input_ids"] if i in STORE.nodes]
+                if run["backend"] == "mock":
+                    time.sleep(1.2)
+                    raw = json.dumps(mock_response(run, inputs, topic_cfg))
                 else:
-                    inputs = [STORE.nodes[i] for i in run["input_ids"] if i in STORE.nodes]
-                    if run["backend"] == "mock":
-                        time.sleep(1.2)
-                        raw = json.dumps(mock_response(run, inputs, topic_cfg))
-                    else:
-                        raw = self._call_claude(run)
-                    run["raw_output"] = raw
-                    apply_result(run, extract_json(raw), inputs)
+                    raw = self._call_claude(run)
+                run["raw_output"] = raw
+                apply_result(run, extract_json(raw), inputs)
                 run["status"] = "done"
             except Cancelled:
                 run["status"] = "cancelled"
@@ -1320,18 +1248,6 @@ class Runner:
                 run["duration_s"] = round(time.time() - t0, 1)
                 self.procs.pop(run_id, None)
                 STORE.save_run(run)
-        if run["status"] == "done" and run.get("chain") == "vet" and run["created_node_ids"]:
-            self._chain_extract_facts(run)
-
-    def _chain_extract_facts(self, parent: dict) -> None:
-        topic_cfg = STORE.topic_cfg(parent["topic"])
-        sources = [STORE.nodes[i] for i in parent["created_node_ids"] if i in STORE.nodes][:5]
-        params = {"limit": 5, "per_item": 8, "input_ids": [n["id"] for n in sources], "note": "Vetting pass: extract as many distinct, high-quality facts as the sources support."}
-        run = self.make_run("extract_facts", topic_cfg, params, sources, build_prompt("extract_facts", topic_cfg, params, sources))
-        run["chain_parent"] = parent["id"]
-        STORE.save_run(run)
-        self.submit(run)
-
     def _call_claude(self, run: dict) -> str:
         cfg = STORE.config
         cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence", "--max-budget-usd", str(cfg["budget_usd"])]
@@ -1362,56 +1278,6 @@ class Runner:
         if envelope.get("is_error"):
             raise RuntimeError(str(envelope.get("result") or err)[:600])
         return str(envelope.get("result", ""))
-
-    def _run_opentdb(self, run: dict, topic_cfg: dict) -> None:
-        params = run["params"]
-        categories = [int(c) for c in params.get("categories", [])]
-        keywords = [k.lower() for k in params.get("keywords", []) if k.strip()]
-        pages = max(1, min(int(params.get("pages") or 2), 6))
-        if not categories:
-            raise RuntimeError("no OpenTDB categories configured for this topic")
-        known = {n["payload"].get("opentdb_id") for n in STORE.nodes.values() if n["topic"] == topic_cfg["id"] and n["kind"] == "source"}
-        created: list[str] = []
-
-        def fetch(url: str) -> dict:
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-
-        token = fetch("https://opentdb.com/api_token.php?command=request").get("token", "")
-        seen = scanned = 0
-        for cat in categories:
-            for _ in range(pages):
-                if run.get("cancel_requested"):
-                    raise Cancelled()
-                time.sleep(5.3)  # OpenTDB allows one request per ~5s
-                data = fetch(f"https://opentdb.com/api.php?amount=50&category={cat}&type=multiple&token={token}")
-                if data.get("response_code") == 5:
-                    time.sleep(6)
-                    data = fetch(f"https://opentdb.com/api.php?amount=50&category={cat}&type=multiple&token={token}")
-                if data.get("response_code") != 0:
-                    break
-                for item in data["results"]:
-                    scanned += 1
-                    q = html.unescape(item["question"])
-                    if keywords and not any(k in q.lower() for k in keywords):
-                        continue
-                    ans = html.unescape(item["correct_answer"])
-                    wrong = [html.unescape(w) for w in item["incorrect_answers"]]
-                    oid = "otdb_" + re.sub(r"\W+", "", q.lower())[:60]
-                    if oid in known:
-                        continue
-                    known.add(oid)
-                    seen += 1
-                    node = STORE.create_node(topic_cfg["id"], "source", {
-                        "source_type": "opentdb", "opentdb_id": oid, "title": q[:90], "url": "https://opentdb.com/",
-                        "summary": f"Q: {q}  A: {ans}  (distractors: {', '.join(wrong)})",
-                        "excerpt": f"Q: {q} -> {ans}", "license": "CC BY-SA 4.0 (Open Trivia DB) - use as facts/structure, rewrite the wording",
-                        "opentdb": {"category": item.get("category"), "difficulty": item.get("difficulty"), "question": q, "correct": ans, "incorrect": wrong},
-                    }, [], None, "draft", {"origin": "opentdb", "run_id": run["id"], "stage": "opentdb", "backend": "opentdb", "mock": False})
-                    created.append(node["id"])
-        run["created_node_ids"] = created
-        run["raw_output"] = f"scanned {scanned} OpenTDB questions, kept {seen} matching the keyword filter"
-
 
 # --------------------------------------------------------------------------
 # export
@@ -1562,6 +1428,7 @@ def api_state() -> dict:
         "departments": DEPARTMENTS,
         "tiers": [{"name": n, "score": sc, "anchor": a} for n, sc, a in TIERS],
         "active_runs": RUNNER.active_count(),
+        "review_count": sum(1 for n in S.nodes.values() if n["kind"] in QUESTION_KINDS and n["status"] == "draft"),
         "stages": STAGE_LABELS,
         "variant_types": {k: v for k, v in VARIANT_TYPES.items()},
     }
@@ -1799,6 +1666,43 @@ def api_suggestion(node_id: str, body: dict) -> dict:
     return api_node(node_id)
 
 
+def api_review(body: dict) -> dict:
+    """Cards to look through one by one. mode "drafts" = cards still in draft; "attention" = drafts plus any card that
+    has a fact but is unchecked, changed since its check, or has issues. Ordered by topic, then creation."""
+    S = STORE
+    mode, only = clean_str(body.get("mode")) or "drafts", clean_str(body.get("topic"))
+    tmap = {t["id"]: t for t in S.config["topics"]}
+    order = {t["id"]: i for i, t in enumerate(S.config["topics"])}
+
+    def wanted(n: dict) -> bool:
+        if n["kind"] not in QUESTION_KINDS or n["status"] == "rejected" or n["topic"] not in tmap or tmap[n["topic"]].get("stage") == "archived":
+            return False
+        if only and n["topic"] != only:
+            return False
+        return n["status"] == "draft" or (mode == "attention" and needs_check(n))
+
+    # Same ordering as a topic's own list (creation time, then insertion order), so Review and the topic screen agree.
+    pool = sorted((n for n in S.nodes.values() if wanted(n)), key=lambda n: (order.get(n["topic"], 999), n["created_at"]))
+    per_topic: dict[str, int] = {}
+    for n in pool:
+        per_topic[n["topic"]] = per_topic.get(n["topic"], 0) + 1
+    cards = []
+    for n in pool[:400]:
+        p, rec, t = n["payload"], n.get("check") or {}, tmap[n["topic"]]
+        facts = fact_ancestors(n)
+        src = next((a for a in S.ancestors_of(n["id"]) if a["kind"] == "source"), None)
+        state = check_state(n)
+        cards.append({
+            "id": n["id"], "topic": n["topic"], "topic_name": t["name"], "department": t["department"], "kind": n["kind"], "variant_type": n.get("variant_type"),
+            "status": n["status"], "payload": {k: p.get(k) for k in ("title", "facet", "question", "answer", "choices", "difficulty", "explanation", "input_type")},
+            "check": state, "notes": rec.get("notes", "") if state in ("ok", "issues") else "", "suggestion": n.get("suggestion"),
+            "has_fact": bool(facts), "fact": {"text": facts[0]["payload"].get("text", ""), "context": facts[0]["payload"].get("context", "")} if facts else None,
+            "source": {"title": src["payload"].get("title", ""), "url": src["payload"].get("url", "")} if src else None,
+            "problems": normalize_question(p, p.get("input_type"), topic_facets(n["topic"]))[1],
+        })
+    return {"cards": cards, "total": len(pool), "topics": [{"id": tid, "name": tmap[tid]["name"], "count": c} for tid, c in sorted(per_topic.items(), key=lambda kv: order.get(kv[0], 999))]}
+
+
 def api_search(body: dict) -> dict:
     S = STORE
     q = clean_str(body.get("q")).lower()
@@ -1823,55 +1727,40 @@ def api_run(body: dict) -> dict:
     if not topic_cfg or stage not in STAGE_LABELS:
         raise ApiError(400, "need a valid topic and stage")
     params = body.get("params") or {}
-    if stage == "opentdb":
-        hints = topic_cfg.get("opentdb", {})
-        params = {"categories": params.get("categories") or hints.get("categories", []),
-                  "keywords": params.get("keywords") if params.get("keywords") is not None else hints.get("keywords", []),
-                  "pages": params.get("pages") or 2}
-        prompt = (f"(no AI) Fetch up to {params['pages']} page(s) of 50 questions from each OpenTDB category {params['categories']} "
-                  f"and keep those mentioning any of: {params['keywords'] or 'anything'}. Each match becomes a source node (CC BY-SA - rewrite, don't copy).")
-        inputs: list[dict] = []
-    else:
-        if stage == "revise":
-            nid = (params.get("input_ids") or [None])[0]
-            if nid not in S.nodes or S.nodes[nid]["kind"] not in QUESTION_KINDS:
-                raise ApiError(400, "revise needs a question or variant node")
-            if not clean_str(params.get("note")):
-                raise ApiError(400, "write a note describing what to change")
-        if stage == "make_variants" and params.get("variant_type", "paraphrase") not in VARIANT_TYPES:
-            raise ApiError(400, "unknown variant type")
-        if stage == "draft_questions" and clean_str(params.get("difficulty")).lower() not in ("", "auto", *TIER_NAMES):
-            raise ApiError(400, "difficulty must be auto or one of: " + ", ".join(TIER_NAMES))
-        if stage == "suggest_facets" and topic_cfg.get("facets"):
-            raise ApiError(400, "this topic already has facets - edit them on the topic page")
-        if stage == "assign_facets" and not topic_cfg.get("facets"):
-            raise ApiError(400, "give the topic facets first (type them in, or use Suggest facets)")
-        if stage == "check_accuracy":
-            for nid in params.get("input_ids") or []:
-                nd = S.nodes.get(nid)
-                if not nd or nd["kind"] not in QUESTION_KINDS or not fact_ancestors(nd):
-                    raise ApiError(400, "check_accuracy needs cards that were written from a fact")
-        inputs = select_inputs(stage, topic_id, params)
-        if stage in ("extract_facts", "draft_questions", "make_variants", "revise", "assign_facets", "add_explanations", "check_accuracy", "fill_card") and not inputs:
-            raise ApiError(400, {"extract_facts": "no sources are waiting for fact extraction", "draft_questions": "no facts are waiting for questions",
-                                 "make_variants": "no approved questions are waiting for that variant type", "revise": "nothing to revise",
-                                 "assign_facets": "every card in this topic already has a facet",
-                                 "add_explanations": "every card in this topic already has an explanation",
-                                 "check_accuracy": "nothing needs checking - every card with a fact is checked and unchanged",
-                                 "fill_card": "no card has blanks to fill"}[stage])
-        prompt = build_prompt(stage, topic_cfg, params, inputs)
-        override = clean_str(body.get("prompt"))
-        if override:   # the author edited the generated prompt before running it
-            if "Output:" not in override:
-                raise ApiError(400, "keep the 'Output:' line at the end of the prompt - the studio needs it to read the answer")
-            prompt = override
+    if stage == "make_variants" and params.get("variant_type", "paraphrase") not in VARIANT_TYPES:
+        raise ApiError(400, "unknown variant type")
+    if stage == "draft_questions" and clean_str(params.get("difficulty")).lower() not in ("", "auto", *TIER_NAMES):
+        raise ApiError(400, "difficulty must be auto or one of: " + ", ".join(TIER_NAMES))
+    if stage == "suggest_facets" and topic_cfg.get("facets"):
+        raise ApiError(400, "this topic already has facets - edit them on the topic page")
+    if stage == "assign_facets" and not topic_cfg.get("facets"):
+        raise ApiError(400, "give the topic facets first (type them in, or use Suggest facets)")
+    if stage == "check_accuracy":
+        for nid in params.get("input_ids") or []:
+            nd = S.nodes.get(nid)
+            if not nd or nd["kind"] not in QUESTION_KINDS or not fact_ancestors(nd):
+                raise ApiError(400, "check_accuracy needs cards that were written from a fact")
+    inputs = select_inputs(stage, topic_id, params)
+    if stage in ("extract_facts", "draft_questions", "make_variants", "assign_facets", "add_explanations", "check_accuracy", "fill_card") and not inputs:
+        raise ApiError(400, {"extract_facts": "no sources are waiting for fact extraction", "draft_questions": "no facts are waiting for questions",
+                             "make_variants": "no approved questions are waiting for that variant type",
+                             "assign_facets": "every card in this topic already has a facet",
+                             "add_explanations": "every card in this topic already has an explanation",
+                             "check_accuracy": "nothing needs checking - every card with a fact is checked and unchanged",
+                             "fill_card": "no card has blanks to fill"}[stage])
+    prompt = build_prompt(stage, topic_cfg, params, inputs)
+    override = clean_str(body.get("prompt"))
+    if override:   # the author edited the generated prompt before running it
+        if "Output:" not in override:
+            raise ApiError(400, "keep the 'Output:' line at the end of the prompt - the studio needs it to read the answer")
+        prompt = override
     followup = ""
     if stage == "draft_questions" and not params.get("input_ids"):
         rest = len(facts_waiting(topic_id, clean_str(params.get("under")))) - len(inputs)
         if rest > 0:
             followup = f"{rest} more fact(s) are still waiting after this batch. Run it again when this one finishes."
     if body.get("preview"):
-        return {"preview": True, "followup": followup, "stage": stage, "label": STAGE_LABELS[stage], "backend": "opentdb" if stage == "opentdb" else S.config["backend"],
+        return {"preview": True, "followup": followup, "stage": stage, "label": STAGE_LABELS[stage], "backend": S.config["backend"],
                 "model": S.config.get("model") or "(CLI default)", "tools": STAGE_TOOLS.get(stage, []), "prompt": prompt,
                 "input_ids": [n["id"] for n in inputs], "inputs": [{"id": n["id"], "kind": n["kind"], "snippet": S.snippet(n)} for n in inputs]}
     run = RUNNER.make_run(stage, topic_cfg, params, inputs, prompt)
@@ -1967,7 +1856,7 @@ def api_create_topic(body: dict) -> dict:
             tid = f"{base}_{i}"
             i += 1
         S.config["topics"].append({"id": tid, "name": name, "department": department, "folder": tid, "target": 24, "stage": "idea",
-                                   "note": clean_str(body.get("note")), "facets": clean_facets(body.get("facets")), "created_at": now_iso(), "opentdb": {"categories": [], "keywords": []}})
+                                   "note": clean_str(body.get("note")), "facets": clean_facets(body.get("facets")), "created_at": now_iso()})
         S.save_config()
     return S.topic_summary(S.topic_cfg(tid))
 
@@ -2013,42 +1902,31 @@ def api_update_topic(topic_id: str, body: dict) -> dict:
     return S.topic_summary(t)
 
 
-def api_delete_topic(topic_id: str) -> dict:
-    S = STORE
+def api_delete_topic(topic_id: str, body: dict | None = None) -> dict:
+    """Permanently delete a topic and everything in it. An approved topic has to be un-approved first, so game content
+    can't go by accident. body {"preview": true} counts what would go; {"cascade": true} is required if it has content."""
+    S, body = STORE, body or {}
     with S.lock:
         t = S.topic_cfg(topic_id)
         if not t:
             raise ApiError(404, "unknown topic")
-        if t.get("stage", "active") == "active":
-            raise ApiError(400, "active topics can't be deleted")
-        if any(n["topic"] == topic_id for n in S.nodes.values()):
-            raise ApiError(400, "this idea has sources/facts attached - archive it instead")
+        if t.get("approved"):
+            raise ApiError(400, "this topic is approved for the game - un-approve it first")
+        ids = [n["id"] for n in S.nodes.values() if n["topic"] == topic_id]
+        by_kind: dict[str, int] = {}
+        for i in ids:
+            by_kind[S.nodes[i]["kind"]] = by_kind.get(S.nodes[i]["kind"], 0) + 1
+        info = {"nodes": len(ids), "by_kind": by_kind}
+        if body.get("preview"):
+            return {"preview": True, **info}
+        if ids and not body.get("cascade"):
+            raise ApiError(400, f"this topic still has {len(ids)} item(s); delete with cascade to remove them too", info)
+        for i in ids:
+            del S.nodes[i]
         S.config["topics"].remove(t)
         S.save_config()
-    return {"deleted": topic_id}
-
-
-def api_vet(topic_id: str, body: dict) -> dict:
-    """Vetting = find sources, then (automatically, on success) extract facts from them."""
-    S = STORE
-    t = S.topic_cfg(topic_id)
-    if not t:
-        raise ApiError(404, "unknown topic")
-    if t.get("stage", "active") != "idea":
-        raise ApiError(400, "only ideas are vetted")
-    if S.vet_summary(topic_id)["verdict"] == "vetting":
-        raise ApiError(400, "a vetting run is already in progress for this idea")
-    params = {"count": 5, "note": "Vetting pass: look for sources with large amounts of discrete factual material (long articles, lists, databases), from at least two independent sites."}
-    prompt = build_prompt("find_sources", t, params, [])
-    if body.get("preview"):
-        return {"preview": True, "stage": "find_sources", "label": "Vet idea (step 1 of 2: find sources)", "backend": S.config["backend"],
-                "model": S.config.get("model") or "(CLI default)", "tools": STAGE_TOOLS["find_sources"], "prompt": prompt, "input_ids": [], "inputs": [],
-                "followup": "When this finishes, the studio automatically runs 'Extract facts' on the sources it found (step 2) - you'll see a second run appear. The idea is judged on how many distinct facts and independent sites come out."}
-    run = RUNNER.make_run("find_sources", t, params, [], prompt)
-    run["chain"] = "vet"
-    S.save_run(run)
-    RUNNER.submit(run)
-    return run_summary(run)
+        (CONTENT / "topics" / f"{topic_id}.json").unlink(missing_ok=True)
+    return {"deleted": topic_id, **info}
 
 
 def api_test_backend() -> dict:
@@ -2085,8 +1963,6 @@ def api_put_config(body: dict) -> dict:
                     for key in ("name", "department", "folder", "target"):
                         if key in incoming:
                             t[key] = incoming[key]
-                    if "opentdb" in incoming:
-                        t["opentdb"] = incoming["opentdb"]
         S.save_config()
     return {"ok": True, "instructions": S.config["instructions"], "topics": S.config["topics"], **api_state()["config"]}
 
@@ -2110,6 +1986,7 @@ route("PUT", r"/api/nodes/([\w-]+)")(lambda m, b: api_update_node(m.group(1), b)
 route("DELETE", r"/api/nodes/([\w-]+)")(lambda m, b: api_delete_node(m.group(1), b))
 route("POST", r"/api/nodes/([\w-]+)/suggestion")(lambda m, b: api_suggestion(m.group(1), b))
 route("GET", r"/api/search")(lambda m, b: api_search(b))
+route("GET", r"/api/review")(lambda m, b: api_review(b))
 route("POST", r"/api/fill")(lambda m, b: api_fill(b))
 route("POST", r"/api/check")(lambda m, b: api_check(b))
 route("POST", r"/api/nodes")(lambda m, b: api_create_node(b))
@@ -2120,9 +1997,8 @@ route("POST", r"/api/runs/([\w-]+)/cancel")(lambda m, b: (RUNNER.cancel(m.group(
 route("POST", r"/api/export")(lambda m, b: {"results": [export_topic(t, bool(b.get("write"))) for t in ([b["topic"]] if b.get("topic") else [x["id"] for x in STORE.topics_in_stage("active") if x.get("approved")])]})
 route("POST", r"/api/topics")(lambda m, b: api_create_topic(b))
 route("PUT", r"/api/topics/([\w-]+)")(lambda m, b: api_update_topic(m.group(1), b))
-route("DELETE", r"/api/topics/([\w-]+)")(lambda m, b: api_delete_topic(m.group(1)))
+route("DELETE", r"/api/topics/([\w-]+)")(lambda m, b: api_delete_topic(m.group(1), b))
 route("POST", r"/api/topics/([\w-]+)/approve")(lambda m, b: api_approve_bulk(m.group(1), b))
-route("POST", r"/api/topics/([\w-]+)/vet")(lambda m, b: api_vet(m.group(1), b))
 route("POST", r"/api/import-game-data")(lambda m, b: import_game_data())
 route("POST", r"/api/test-backend")(lambda m, b: api_test_backend())
 
