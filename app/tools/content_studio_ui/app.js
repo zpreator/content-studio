@@ -594,9 +594,11 @@ function nodeDetail(d, topic, reload) {
       h("label", {}, `Choices - select the correct one (${p.input_type})`), choicesBox,
       h("div", { class: "grid2" }, h("div", {}, field("difficulty", "Difficulty", h("select", {}, tierNames().map(x => h("option", { value: x, selected: x === p.difficulty }, `${x} (${ui.state.tiers.find(t => t.name === x)?.score ?? "?"} pts)`))))),
         h("div", {}, field("card_id", "Card id (used in the game files)", h("input", { type: "text", value: p.card_id || "", style: "width:100%" })))),
-      field("explanation", "Did you know (shown after the answer, max 240 characters)", explTa),
+      field("explanation", "Did you know - a real fact; the AI can write this one (shown after the answer, max 240 characters)", explTa),
       field("explanation_source", "Explanation source (url)", h("input", { type: "text", value: p.explanation_source || "", style: "width:100%" })),
-      h("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text)" }, verifiedBox, "I checked this explanation against its source")];
+      h("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text)" }, verifiedBox, "I checked this explanation against its source"),
+      field("snark", "Snarky response - optional, you write this one (the AI never does)", h("textarea", { rows: 2, value: p.snark || "" })),
+      field("story", "Story - optional, blank for now (the AI never writes it)", h("textarea", { rows: 3, value: p.story || "" }))];
   }
 
   const collect = () => {
@@ -705,7 +707,8 @@ async function viewReview(query) {
   const fold = (d) => {   // fold a fresh api_node() answer into the local copy of the card
     const c = S.cards.find(x => x.id === d.node.id); if (!c) return;
     const p = d.node.payload;
-    Object.assign(c.payload, { title: p.title, facet: p.facet, question: p.question, answer: p.answer, choices: p.choices, difficulty: p.difficulty, explanation: p.explanation });
+    Object.assign(c.payload, { title: p.title, facet: p.facet, question: p.question, answer: p.answer, choices: p.choices, difficulty: p.difficulty, explanation: p.explanation, snark: p.snark, story: p.story });
+    c.missing = d.check.missing || [];
     c.check = d.check.state; c.suggestion = d.check.suggestion; c.problems = d.problems; c.status = d.node.status;
     c.notes = ["ok", "issues"].includes(c.check) ? (d.check.record?.notes || "") : "";
   };
@@ -728,20 +731,22 @@ async function viewReview(query) {
     confirmModal("Delete this card permanently?", (pre.children ? `Its ${pre.children} derived item${pre.children === 1 ? "" : "s"} would go too. ` : "") + "There is no archive and no undo.", "Delete", "bad",
       async () => { await api("DELETE", `/api/nodes/${c.id}`, { cascade: true }); drop(); render(); syncNav(); });
   };
-  const check = async () => {
+  const runAi = async (kind, blocked) => {   // run a check / fill on this card without a prompt dialog, then fold the result in
     const c = cur(); if (!c || S.editing || S.checking) return;
-    if (!c.has_fact) return toast("This card has no fact to check against", true);
-    const run = await guarded(() => api("POST", "/api/check", { topic: c.topic, node_id: c.id })); if (!run) return;
+    if (blocked && blocked(c)) return toast(blocked(c), true);
+    const run = await guarded(() => api("POST", `/api/${kind}`, { topic: c.topic, node_id: c.id })); if (!run) return;
     S.checking = true; render();
     for (let n = 0; n < 150; n++) {
       await new Promise(r => setTimeout(r, 1200));
       const r = await api("GET", `/api/runs/${run.id}`).catch(() => null);
-      if (r && ["done", "failed", "cancelled"].includes(r.status)) { if (r.status !== "done") toast(`Check ${r.status}${r.error ? ": " + r.error : ""}`, true); break; }
+      if (r && ["done", "failed", "cancelled"].includes(r.status)) { if (r.status !== "done") toast(`${kind === "fill" ? "Fill" : "Check"} ${r.status}${r.error ? ": " + r.error : ""}`, true); break; }
     }
     S.checking = false;
     const d = await guarded(() => api("GET", `/api/nodes/${c.id}`)); if (d) fold(d);
     render();
   };
+  const check = () => runAi("check", (c) => c.has_fact ? "" : "This card has no fact to check against");
+  const fill = () => runAi("fill", (c) => (c.missing || []).length ? "" : "Nothing is blank on this card");
   const suggest = async (action) => { const c = cur(); const d = await guarded(() => api("POST", `/api/nodes/${c.id}/suggestion`, { action })); if (d) { fold(d); S.armed = false; render(); } };
   const setDiff = async (idx) => {
     const c = cur(); if (!c) return;
@@ -753,11 +758,11 @@ async function viewReview(query) {
   const saveEdit = async () => {
     if (!S.editing || !editRefs) return;
     const c = cur(), ch = editRefs.choices.map(x => x.value), ai = editRefs.radios.findIndex(r => r.checked);
-    const d = await guarded(() => api("PUT", `/api/nodes/${c.id}`, { payload: { question: editRefs.q.value, choices: ch, answer: ai >= 0 ? ch[ai] : "", difficulty: editRefs.diff.value, explanation: editRefs.exp.value } }));
+    const d = await guarded(() => api("PUT", `/api/nodes/${c.id}`, { payload: { question: editRefs.q.value, choices: ch, answer: ai >= 0 ? ch[ai] : "", difficulty: editRefs.diff.value, explanation: editRefs.exp.value, snark: editRefs.snark.value, story: editRefs.story.value } }));
     if (d) { fold(d); S.editing = false; S.armed = false; toast("Saved"); render(); }
   };
   const help = () => modal("Review shortcuts", h("div", {}, h("div", { class: "kv", style: "grid-template-columns:90px 1fr" }, [
-      ["A or \u2192", "Approve (press twice if it hasn't been checked)"], ["S or \u2190", "Skip to the next card"], ["K", "Back to the previous card"], ["E", "Edit this card"], ["C", "Check for accuracy"],
+      ["A or \u2192", "Approve (press twice if it hasn't been checked)"], ["S or \u2190", "Skip to the next card"], ["K", "Back to the previous card"], ["E", "Edit this card"], ["C", "Check for accuracy"], ["F", "Fill in what's blank (e.g. the 'did you know')"],
       ["O", "Open it in the full editor"], ["D", "Delete it"], ["1 - 5", "Set difficulty straight away"], ["Esc", "Cancel an edit"], ["Ctrl+S", "Save an edit"], ["?", "This list"]]
       .map(([k, v]) => [h("div", { class: "mono" }, k), h("div", {}, v)])),
     h("div", { class: "muted small", style: "margin-top:10px" }, "On a phone: swipe right to approve, left to skip.")), [{ label: "Close" }]);
@@ -773,12 +778,14 @@ async function viewReview(query) {
       const choices = [...(p.choices || []), "", "", "", ""].slice(0, p.input_type === "true_false" ? 2 : 4);
       const aIdx = choices.indexOf(p.answer);
       const q = h("textarea", { rows: 3, value: p.question || "" }), exp = h("textarea", { rows: 2, value: p.explanation || "" });
+      const snark = h("textarea", { rows: 2, value: p.snark || "" }), story = h("textarea", { rows: 3, value: p.story || "" });
       const radios = choices.map((x, i) => h("input", { type: "radio", name: "rans", checked: i === aIdx }));
       const inputs = choices.map(x => h("input", { type: "text", value: x, disabled: p.input_type === "true_false" }));
       const diff = h("select", {}, tierNames().map(x => h("option", { value: x, selected: x === p.difficulty }, x)));
-      editRefs = { q, exp, radios, choices: inputs, diff };
+      editRefs = { q, exp, snark, story, radios, choices: inputs, diff };
       return h("div", { class: "rcard editing" }, meta, h("label", {}, "Question"), q, h("label", {}, "Choices - select the correct one"),
-        inputs.map((inp, i) => h("div", { class: "choice-row" }, radios[i], inp)), h("div", { class: "grid2" }, h("div", {}, h("label", {}, "Difficulty"), diff)), h("label", {}, "Did you know"), exp,
+        inputs.map((inp, i) => h("div", { class: "choice-row" }, radios[i], inp)), h("div", { class: "grid2" }, h("div", {}, h("label", {}, "Difficulty"), diff)), h("label", {}, "Did you know (a real fact)"), exp,
+        h("label", {}, "Snarky response (optional - yours to write)"), snark, h("label", {}, "Story (optional)"), story,
         h("div", { class: "ractions" }, h("button", { class: "big", onclick: cancelEdit }, "Cancel (Esc)"), h("button", { class: "big primary", onclick: saveEdit }, "Save (Ctrl+S)")));
     }
     const warnArm = S.armed ? h("div", { class: "rwarn" }, `This card ${c.check === "issues" ? "was checked and has unresolved issues" : c.check === "stale" ? "changed since its last check" : "hasn't been checked for accuracy"}. Approve it anyway?`) : null;
@@ -789,7 +796,10 @@ async function viewReview(query) {
       (p.facet || p.title) ? h("div", { class: "rlabel" }, p.facet || p.title) : null,
       h("div", { class: "rq" }, p.question || "(no question text)"),
       h("div", { class: "rchoices" }, (p.choices || []).map(ch => h("div", { class: "rchoice" + (ch === p.answer ? " correct" : "") }, ch === p.answer ? h("span", { class: "tick" }, "\u2713 ") : null, ch))),
-      p.explanation ? h("div", { class: "rexp" }, h("span", { class: "muted small" }, "Did you know: "), p.explanation) : null,
+      p.explanation ? h("div", { class: "rexp" }, h("span", { class: "muted small" }, "Did you know: "), p.explanation)
+        : h("div", { class: "rexp muted small" }, c.has_fact ? "No 'did you know' yet - press F and the AI will write one from the fact." : "No 'did you know' yet."),
+      p.snark ? h("div", { class: "rextra" }, h("span", { class: "muted small" }, "Snarky response: "), p.snark) : null,
+      p.story ? h("div", { class: "rextra" }, h("span", { class: "muted small" }, "Story: "), p.story) : null,
       c.problems.length ? h("div", { class: "warn small", style: "margin-top:8px" }, "Needs fixing before approval: " + c.problems.join("; ")) : null,
       c.notes ? h("div", { class: c.check === "issues" ? "err" : "muted", style: "margin-top:8px" }, "Check: " + c.notes) : null, sug,
       c.fact ? h("details", { style: "margin-top:10px" }, h("summary", { class: "muted" }, "The fact this came from"), h("div", { style: "margin-top:6px" }, c.fact.text),
@@ -798,7 +808,8 @@ async function viewReview(query) {
       warnArm,
       h("div", { class: "ractions" },
         h("button", { class: "big", title: "Skip (S or left arrow)", onclick: skip }, "\u2190 Skip"),
-        h("button", { onclick: startEdit, title: "Edit (E)" }, "Edit"), h("button", { disabled: !c.has_fact || S.checking, onclick: check, title: "Check for accuracy (C)" }, S.checking ? "Checking..." : "Check"),
+        h("button", { onclick: startEdit, title: "Edit (E)" }, "Edit"), h("button", { disabled: !c.has_fact || S.checking, onclick: check, title: "Check for accuracy (C)" }, S.checking ? "Working..." : "Check"),
+        h("button", { disabled: !(c.missing || []).length || S.checking, onclick: fill, title: "Fill in what's blank, e.g. the 'did you know' (F)" }, "Fill"),
         h("button", { onclick: open, title: "Open in the full editor (O)" }, "Full editor"), h("button", { class: "ghost bad", onclick: del, title: "Delete (D)" }, "Delete"),
         h("button", { class: "big good", title: "Approve (A or right arrow)", onclick: approve }, S.armed ? "Approve anyway \u2192" : "Approve \u2192")),
       h("div", { class: "swipehint" }, "swipe right to approve, left to skip"));
@@ -823,7 +834,7 @@ async function viewReview(query) {
       h("p", { class: "muted" }, S.cards.length ? `${S.cards.length} card${S.cards.length === 1 ? " is" : "s are"} still waiting (the ones you skipped).` : (S.approved ? `${S.approved} approved this session. Nothing left to review here.` : "Nothing is waiting for review here.")),
       h("div", { class: "row" }, S.cards.length ? h("button", { class: "primary", onclick: () => { S.i = 0; render(); } }, "Go through them again") : null, h("button", { onclick: () => go("#/board") }, "Back to the board")));
     box.replaceChildren(bar, c ? cardView(c) : done);
-    ui.keys = c ? { right: approve, left: skip, next: skip, prev: back, approve, skip, edit: startEdit, check, open, del, esc: cancelEdit, save: saveEdit, help,
+    ui.keys = c ? { right: approve, left: skip, next: skip, prev: back, approve, skip, edit: startEdit, check, fill, open, del, esc: cancelEdit, save: saveEdit, help,
       diff: (i) => { if (!S.editing) setDiff(i); } } : { help };
   }
   $view.replaceChildren(h("h1", {}, "Review"), box);
@@ -871,6 +882,7 @@ async function viewSettings() {
   const model = h("input", { type: "text", value: cfg.model || "", placeholder: "blank = CLI default, or e.g. sonnet / opus", style: "width:100%" });
   const budget = h("input", { type: "number", step: "0.25", value: cfg.budget_usd, style: "width:90px" }), timeout = h("input", { type: "number", value: cfg.timeout_s, style: "width:90px" }), conc = h("input", { type: "number", value: cfg.concurrency, style: "width:70px" });
   const reqVerified = h("input", { type: "checkbox", checked: cfg.require_verified_explanations !== false });
+  const exportExtras = h("input", { type: "checkbox", checked: cfg.export_extras !== false });
   const typeBoxes = INPUT_TYPES.map(t => h("label", { style: "display:inline-flex;gap:4px;margin-right:14px;align-items:center;color:var(--text)" }, h("input", { type: "checkbox", checked: cfg.game_input_types.includes(t), value: t }), t));
   const globalIns = h("textarea", { rows: 12, value: ins.global || "" });
   const depts = [...new Set(cfg.topics.map(t => t.department))];
@@ -885,7 +897,7 @@ async function viewSettings() {
     document.querySelectorAll("textarea[data-stage]").forEach(e => instructions.stages[e.dataset.stage] = e.value);
     await api("PUT", "/api/config", {
       backend: backend.value, model: model.value.trim(), budget_usd: +budget.value, timeout_s: +timeout.value, concurrency: +conc.value,
-      game_input_types: typeBoxes.map(l => l.querySelector("input")).filter(i => i.checked).map(i => i.value), require_verified_explanations: reqVerified.checked, instructions,
+      game_input_types: typeBoxes.map(l => l.querySelector("input")).filter(i => i.checked).map(i => i.value), require_verified_explanations: reqVerified.checked, export_extras: exportExtras.checked, instructions,
       topics: topicRows.map(r => ({ id: r.t.id, target: +r.target.value })),
     });
     toast("Settings saved"); await refreshState(); renderNav("settings");
@@ -900,6 +912,7 @@ async function viewSettings() {
         h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => guarded(async () => { result.textContent = "testing..."; await save(); const r = await api("POST", "/api/test-backend", {}); result.textContent = (r.ok ? "OK: " : "FAILED: ") + r.detail; result.className = r.ok ? "tag-ok small" : "err small"; }) }, "Save + test AI backend"), result),
         h("label", {}, "Input types the game can currently play (only these are exported)"), h("div", {}, typeBoxes),
         h("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text);margin-top:12px" }, reqVerified, "Only export explanations I've marked verified"),
+        h("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text);margin-top:8px" }, exportExtras, "Include snarky responses and stories in exported cards (only cards that have them)"),
         ),
       h("div", { class: "panel" }, h("h2", {}, "Standing instructions"), h("div", { class: "muted small" }, "Sent with every AI run, in this order: house rules, department, topic (set on each topic page), stage."),
         h("label", {}, "House rules (all stages)"), globalIns, deptIns, stageIns)),
