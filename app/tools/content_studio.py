@@ -64,9 +64,11 @@ TIER_NAMES = [t[0] for t in TIERS]
 DIFFICULTY_SCORES = {name: score for name, score, _ in TIERS}
 SPREAD_SHARES = {"beginner": 0.20, "easy": 0.20, "intermediate": 0.30, "advanced": 0.20, "expert": 0.10}
 EXPLANATION_MAX = 240
+SNARK_MAX = 240     # the author's snarky response: a line or two
+STORY_MAX = 1000    # a story beat can run longer
 MAX_FACTS_PER_SOURCE = 40   # per run, so one response stays a sensible size; run it again for more
-EXPLANATION_SPEC = ('"explanation" (optional "did you know" line: one or two sentences, at most 30 words, each adding something new (no filler), telling the player more about the answer, '
-                    'using ONLY information already in the fact, its context or the card shown - never add outside claims; "" if there is nothing to add)')
+EXPLANATION_SPEC = ('"explanation" (optional real "did you know": a plain, true fact about the answer in one or two sentences, at most 30 words, each adding something new (no filler); '
+                    'no jokes, sarcasm or story - the author writes those in separate fields; using ONLY information already in the fact, its context or the card shown - never add outside claims; "" if there is nothing to add)')
 DEPARTMENTS = ["Geography", "Entertainment", "History", "Arts & Literature", "Science & Nature", "Sports & Leisure"]
 KINDS = ("source", "fact", "question", "variant")
 STATUSES = ("draft", "approved", "rejected")
@@ -208,6 +210,8 @@ def normalize_question(payload: dict, input_type: str | None = None, facets: lis
         "explanation_source": clean_str(payload.get("explanation_source")),
         "explanation_verified": bool(payload.get("explanation_verified")) and bool(clean_str(payload.get("explanation"))),
         "explanation_mock": bool(payload.get("explanation_mock")) and bool(clean_str(payload.get("explanation"))),
+        "snark": clean_str(payload.get("snark")),   # the author's own snarky response (optional); the AI never writes it
+        "story": clean_str(payload.get("story")),   # a story beat (optional, left blank for now); the AI never writes it
         "answer": clean_str(payload.get("answer")),
         "choices": [clean_str(c) for c in (payload.get("choices") or [])],
         "difficulty": clean_str(payload.get("difficulty")).lower(),
@@ -220,6 +224,10 @@ def normalize_question(payload: dict, input_type: str | None = None, facets: lis
         problems.append("question is empty")
     if len(out["explanation"]) > EXPLANATION_MAX:
         problems.append(f"explanation is {len(out['explanation'])} characters (max {EXPLANATION_MAX})")
+    if len(out["snark"]) > SNARK_MAX:
+        problems.append(f"snarky response is {len(out['snark'])} characters (max {SNARK_MAX})")
+    if len(out["story"]) > STORY_MAX:
+        problems.append(f"story is {len(out['story'])} characters (max {STORY_MAX})")
     if facets:
         # A card's face label is its facet. Older cards that only have an AI-written title stay valid until they get one.
         if out["facet"]:
@@ -310,7 +318,7 @@ class Store:
         if migrated and path.exists():
             atomic_write(path, json.dumps(cfg, indent=2, ensure_ascii=False))
         for key, value in (("backend", "claude_cli"), ("model", ""), ("concurrency", 3), ("budget_usd", 1.0),
-                           ("timeout_s", 900), ("game_input_types", ["multiple_choice"]), ("require_verified_explanations", True)):
+                           ("timeout_s", 900), ("game_input_types", ["multiple_choice"]), ("require_verified_explanations", True), ("export_extras", True)):
             cfg.setdefault(key, value)
         return cfg
 
@@ -944,6 +952,7 @@ def apply_result(run: dict, result: dict, inputs: list[dict]) -> None:
             vtype = run["params"].get("variant_type", "paraphrase") if stage == "make_variants" else None
             itype = "true_false" if vtype == "true_false" else "multiple_choice"
             clean, problems = normalize_question(item, itype, topic_facets(topic_id))
+            clean["snark"], clean["story"] = "", ""   # human-only fields: ignore them even if the model returned some
             asked = wanted_tier(run["params"]) if stage == "draft_questions" else ""
             if asked:  # the author's choice wins; say so when the AI's own rating disagrees
                 if clean["difficulty"] != asked:
@@ -1136,7 +1145,8 @@ def mock_response(run: dict, inputs: list[dict], topic_cfg: dict) -> dict:
                           for i, s in enumerate(inputs) for j in range(per)]}
     if stage == "draft_questions":
         return {"questions": [{"fact_id": f["id"], **face(i), "question": f"MOCK: {f['payload'].get('text', '')[:60]} - which is right?", "answer": "Correct answer",
-                               "choices": ["Correct answer", "Wrong A", "Wrong B", "Wrong C"], "explanation": f"MOCK explanation: {f['payload'].get('context', '')}", "difficulty": f["payload"].get("difficulty_hint") or "intermediate"} for i, f in enumerate(inputs)]}
+                               "choices": ["Correct answer", "Wrong A", "Wrong B", "Wrong C"], "explanation": f"MOCK explanation: {f['payload'].get('context', '')}", "difficulty": f["payload"].get("difficulty_hint") or "intermediate",
+                               "snark": "MOCK SNARK that must be ignored", "story": "MOCK STORY that must be ignored"} for i, f in enumerate(inputs)]}
     if stage == "make_variants":
         vt = run["params"].get("variant_type", "paraphrase")
         out = []
@@ -1165,7 +1175,8 @@ def mock_response(run: dict, inputs: list[dict], topic_cfg: dict) -> dict:
         return {"checks": out}
     if stage == "fill_card":
         return {"cards": [{"id": q["id"], **face(i, q["payload"]), "question": q["payload"].get("question") or "MOCK filled question", "answer": q["payload"].get("answer") or "Mock answer",
-                           "choices": [q["payload"].get("answer") or "Mock answer", "Mock wrong A", "Mock wrong B", "Mock wrong C"], "explanation": "MOCK filled explanation"} for i, q in enumerate(inputs)]}
+                           "choices": [q["payload"].get("answer") or "Mock answer", "Mock wrong A", "Mock wrong B", "Mock wrong C"], "explanation": "MOCK filled explanation",
+                           "snark": "MOCK SNARK that must be ignored", "story": "MOCK STORY that must be ignored"} for i, q in enumerate(inputs)]}
     if stage == "suggest_facets":
         return {"facets": ["Mock One", "Mock Two", "Mock Three", "Mock Four"]}
     if stage == "assign_facets":
@@ -1321,6 +1332,11 @@ def export_topic(topic_id: str, write: bool) -> dict:
                 "difficulty": p["difficulty"], "base_score": DIFFICULTY_SCORES[p["difficulty"]], "input_type": p["input_type"]}
         if p.get("facet"):
             card["facet"] = p["facet"]
+        if S.config.get("export_extras", True):   # snarky response / story: written into the file only when the card has them
+            if p.get("snark"):
+                card["snark"] = p["snark"]
+            if p.get("story"):
+                card["story"] = p["story"]
         if p.get("explanation") and p.get("explanation_mock"):
             mock_expl += 1
         elif p.get("explanation"):
@@ -1421,7 +1437,7 @@ def run_summary(run: dict, full: bool = False) -> dict:
 def api_state() -> dict:
     S = STORE
     return {
-        "config": {k: S.config[k] for k in ("backend", "model", "concurrency", "budget_usd", "timeout_s", "game_input_types", "require_verified_explanations")},
+        "config": {k: S.config[k] for k in ("backend", "model", "concurrency", "budget_usd", "timeout_s", "game_input_types", "require_verified_explanations", "export_extras")},
         "topics": [S.topic_summary(t) for t in S.topics_in_stage("active")],
         "ideas": [S.topic_summary(t) for t in S.topics_in_stage("idea")],
         "archived": [S.topic_summary(t) for t in S.topics_in_stage("archived")],
@@ -1694,7 +1710,8 @@ def api_review(body: dict) -> dict:
         state = check_state(n)
         cards.append({
             "id": n["id"], "topic": n["topic"], "topic_name": t["name"], "department": t["department"], "kind": n["kind"], "variant_type": n.get("variant_type"),
-            "status": n["status"], "payload": {k: p.get(k) for k in ("title", "facet", "question", "answer", "choices", "difficulty", "explanation", "input_type")},
+            "status": n["status"], "payload": {k: p.get(k) for k in ("title", "facet", "question", "answer", "choices", "difficulty", "explanation", "snark", "story", "input_type")},
+            "missing": fill_missing(n),
             "check": state, "notes": rec.get("notes", "") if state in ("ok", "issues") else "", "suggestion": n.get("suggestion"),
             "has_fact": bool(facts), "fact": {"text": facts[0]["payload"].get("text", ""), "context": facts[0]["payload"].get("context", "")} if facts else None,
             "source": {"title": src["payload"].get("title", ""), "url": src["payload"].get("url", "")} if src else None,
@@ -1949,7 +1966,7 @@ def api_test_backend() -> dict:
 def api_put_config(body: dict) -> dict:
     S = STORE
     with S.lock:
-        for key in ("backend", "model", "concurrency", "budget_usd", "timeout_s", "game_input_types", "require_verified_explanations"):
+        for key in ("backend", "model", "concurrency", "budget_usd", "timeout_s", "game_input_types", "require_verified_explanations", "export_extras"):
             if key in body:
                 S.config[key] = body[key]
         if S.config["backend"] not in ("claude_cli", "mock"):
